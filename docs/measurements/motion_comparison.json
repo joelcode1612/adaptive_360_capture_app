@@ -1,0 +1,50 @@
+{
+  "schema": "adaptive360.motion-comparison/1",
+  "note": "Synthetic scripted input at 30 Hz with ±0.35° yaw / ±0.25° pitch jitter. Ground truth is the script, so angular errors are exact measurements against that truth — but they say nothing about ARCore accuracy on a device.",
+  "sequence": {
+    "rate_hz": 30,
+    "duration_s": 6.0,
+    "samples": 180,
+    "script": "still 1.5s · turn 90° at 150°/s · still 1.5s · turn back · still"
+  },
+  "scenario_a_jitter_and_error": {
+    "static_jitter_sd_forward_x": {
+      "baseline": 0.0023021189220107994,
+      "candidate_a": 0.0008018988736514732
+    },
+    "mean_abs_error_deg": {
+      "baseline": 0.22919704625633705,
+      "candidate_a": 0.0805557691186128
+    },
+    "max_abs_error_deg": {
+      "baseline": 0.3946717818939304,
+      "candidate_a": 0.2488966356986279
+    },
+    "settle_to_1deg_after_turn_ms": {
+      "baseline": 0,
+      "candidate_a": 333
+    }
+  },
+  "scenario_a_gate": {
+    "first_stable_after_turn_ms": {
+      "on_raw": 467,
+      "on_smoothed": 933
+    },
+    "stable_sample_fraction_after_turn": {
+      "on_raw": 0.25925925925925924,
+      "on_smoothed": 0.48148148148148145
+    }
+  },
+  "scenario_c_realistic_jitter": {
+    "note": "Same gate, ±0.05° jitter — the order ARCore produces once tracking settles. Measured while still, after the camera returned to the target.",
+    "mean_derived_rate_dps": 0.33014692963100706,
+    "still_stable_fraction": 0.7407407407407407,
+    "first_stable_after_return_ms": 467
+  },
+  "scenario_b_carried_while_aimed": {
+    "rate_dps": 20,
+    "moving_samples": 60,
+    "false_ready_samples_baseline_no_rate_gate": 2,
+    "false_ready_samples_candidate_a": 0
+  }
+}

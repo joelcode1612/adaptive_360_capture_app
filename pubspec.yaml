@@ -1,0 +1,83 @@
+name: adaptive_360_capture_app
+description: >-
+  360° Virtual Tour capture: a sensor-guided port of the adaptive 360 HTML
+  prototype, with the reference capture geometry reimplemented in Dart.
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Live preview, real JPEG stills and the low-resolution analysis stream that
+  # the blur/exposure validation reads. `startImageStream` hands over YUV planes,
+  # and plane 0 of a YUV_420_888 frame is exactly the grayscale buffer the
+  # quality rules want, at preview resolution — so validating a frame never
+  # decodes a full-resolution still.
+  camera: ^0.12.1
+  # Gyroscope angular rate for the SETTLE gate, and the accelerometer that the
+  # attitude filter integrates. See platform/sensor_pose_source.dart.
+  sensors_plus: ^7.1.1
+  # A station is minutes of holding the phone still without touching it, which is
+  # exactly the OS idle-timeout pattern. Held and released by the flow controller
+  # for as long as the capture ticker runs.
+  wakelock_plus: ^1.6.1
+  # Pinned: permission_handler_android >=14 needs compileSdk 37; 13.0.1 builds
+  # against SDK 35.
+  permission_handler: ^12.0.3
+  path_provider: ^2.1.6
+  path: ^1.9.1
+  # Screen 9's sphere viewer. Only ever fed a real stitched equirectangular
+  # image; the flow refuses to hand it anything else.
+  panorama_viewer: ^2.0.7
+  cupertino_icons: ^1.0.8
+
+  # The virtual-tour upload workflow: Initial → Processing (REQ-807) → Success
+  # or Error (REQ-808), with duplicate and out-of-order requests rejected in the
+  # Bloc rather than in the screen.
+  flutter_bloc: ^9.1.1
+  # Multipart upload to the Python/OpenCV stitching service, and the JSON submit
+  # that follows it. `http_parser` supplies the `image/jpeg` part content type.
+  http: ^1.6.0
+  http_parser: ^4.1.2
+
+dependency_overrides:
+  permission_handler_android: ^13.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  # On-device flow verification: drives the real wizard on the connected
+  # phone through the VM service (no input injection, so it runs where
+  # `adb shell input` is blocked). Used by `integration_test/
+  # tour_startup_test.dart` to prove the capture screen gets past
+  # "initialise AR tracking".
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+
+  # The two GLB models from the reference prototype, reused byte-for-byte rather
+  # than regenerated. `ar_capture_target.glb` is the 3D capture target and
+  # `white_frame_bezel.glb` the frame around it.
+  #
+  # Declared as two explicit paths rather than as the `assets/models/` directory.
+  # Both forms bundle the same bytes, but the directory form silently includes any
+  # file added later and says nothing when a file is *missing*; naming the two
+  # paths means `flutter build` fails loudly if either asset is renamed, moved or
+  # lost, which is the failure this project can least afford.
+  #
+  # These are the ONLY copies. `GlbMeshSource` reads them through `rootBundle`,
+  # parses them with the project's own `parseGlb`, and uploads the resulting
+  # triangles to the native AR renderer over the platform channel. The Android
+  # `assets/` directory deliberately holds no second copy — there is no native
+  # glTF loader to feed, so a duplicate could only drift.
+  assets:
+    - assets/models/ar_capture_target.glb
+    - assets/models/white_frame_bezel.glb

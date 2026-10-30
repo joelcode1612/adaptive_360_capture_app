@@ -1,0 +1,15 @@
+# Created by `uv sync` — 97 MB of interpreter and site-packages.
+.venv/
+venv/
+
+# Byte-code caches.
+__pycache__/
+*.py[cod]
+
+# Local secrets and runtime state.
+.env
+var/
+
+# Tool caches.
+.pytest_cache/
+.ruff_cache/
