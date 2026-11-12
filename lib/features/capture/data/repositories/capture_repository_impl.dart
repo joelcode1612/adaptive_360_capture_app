@@ -17,7 +17,7 @@ import 'package:adaptive_360_capture_app/features/capture/domain/models/capture_
 /// <appDocs>/ar_capture/
 ///   <stationId>/
 ///     station.json      the calibrated reference pose
-///     targets.json      the 30 targets, with anchor + status
+///     targets.json      the 26 targets, with anchor + status
 ///     records.json      one entry per saved photograph
 ///     frames/
 ///       t01.jpg … t30.jpg
@@ -29,6 +29,13 @@ abstract class CaptureRepository {
   Future<void> saveStation(CaptureStation station);
 
   Future<void> saveTargets(List<CaptureTarget> targets);
+
+  /// Persists a complete calibrated station only after all AR placements exist.
+  /// Implementations stage both metadata files and roll back on failure.
+  Future<void> saveCalibration(
+    CaptureStation station,
+    List<CaptureTarget> targets,
+  );
 
   Future<void> saveRecord(CaptureRecord record);
 
@@ -46,6 +53,144 @@ abstract class CaptureRepository {
   /// The resume entry point needs this to offer "continue where you left off"
   /// without the caller knowing anything about the store's layout.
   Future<List<String>> stationIds();
+}
+
+/// Commits the station and its complete target set as one recoverable local
+/// transaction. A pending marker keeps incomplete work out of resume discovery;
+/// backups let an interrupted or failed replacement restore the previous
+/// accepted calibration without touching records or JPEG files.
+Future<void> persistCaptureCalibrationFiles({
+  required String stationDirectory,
+  required CaptureStation station,
+  required List<CaptureTarget> targets,
+}) async {
+  if (targets.length != station.total ||
+      targets.any((CaptureTarget t) => t.stationId != station.stationId) ||
+      targets.map((CaptureTarget t) => t.targetId).toSet().length !=
+          station.total) {
+    throw StateError(
+      'Calibration must contain the complete unique target set.',
+    );
+  }
+
+  final directory = Directory(stationDirectory);
+  await directory.create(recursive: true);
+  final stationFile = File(p.join(stationDirectory, 'station.json'));
+  final targetsFile = File(p.join(stationDirectory, 'targets.json'));
+  final pending = File(p.join(stationDirectory, '.calibration.pending'));
+  final stationTemp = File(p.join(stationDirectory, '.station.json.pending'));
+  final targetsTemp = File(p.join(stationDirectory, '.targets.json.pending'));
+  final stationBackup = File(
+    p.join(stationDirectory, '.station.json.calibration-backup'),
+  );
+  final targetsBackup = File(
+    p.join(stationDirectory, '.targets.json.calibration-backup'),
+  );
+
+  if (await pending.exists()) {
+    await _rollbackPendingCalibration(stationDirectory);
+  }
+  await _deleteIfExists(stationBackup);
+  await _deleteIfExists(targetsBackup);
+  await _deleteIfExists(stationTemp);
+  await _deleteIfExists(targetsTemp);
+
+  final hadStation = await stationFile.exists();
+  final hadTargets = await targetsFile.exists();
+  await pending.writeAsString(
+    jsonEncode(<String, Object?>{
+      'hadStation': hadStation,
+      'hadTargets': hadTargets,
+    }),
+    flush: true,
+  );
+
+  try {
+    await stationTemp.writeAsString(jsonEncode(station.toJson()), flush: true);
+    await targetsTemp.writeAsString(
+      jsonEncode(targets.map((CaptureTarget t) => t.toJson()).toList()),
+      flush: true,
+    );
+
+    if (hadStation) await stationFile.rename(stationBackup.path);
+    if (hadTargets) await targetsFile.rename(targetsBackup.path);
+    await targetsTemp.rename(targetsFile.path);
+    await stationTemp.rename(stationFile.path);
+
+    final savedStation = CaptureStation.fromJson(
+      jsonDecode(await stationFile.readAsString()) as Map<String, dynamic>,
+    );
+    final savedTargets = (jsonDecode(await targetsFile.readAsString()) as List)
+        .map(
+          (dynamic row) => CaptureTarget.fromJson(row as Map<String, dynamic>),
+        )
+        .toList(growable: false);
+    if (savedStation.stationId != station.stationId ||
+        savedTargets.length != station.total ||
+        savedTargets.any(
+          (CaptureTarget t) => t.stationId != station.stationId,
+        )) {
+      throw StateError('Calibration verification failed after persistence.');
+    }
+
+    // Removing this marker is the commit point: station discovery ignores the
+    // directory until both complete files have been verified.
+    await pending.delete();
+    await _deleteIfExists(stationBackup, ignoreErrors: true);
+    await _deleteIfExists(targetsBackup, ignoreErrors: true);
+  } catch (_) {
+    try {
+      await _rollbackPendingCalibration(stationDirectory);
+    } catch (_) {
+      // Keep the marker if rollback itself fails. Resume discovery will refuse
+      // this directory rather than advertise a partial station as calibrated.
+    }
+    rethrow;
+  }
+}
+
+Future<void> _rollbackPendingCalibration(String stationDirectory) async {
+  final pending = File(p.join(stationDirectory, '.calibration.pending'));
+  if (!await pending.exists()) return;
+  final metadata =
+      jsonDecode(await pending.readAsString()) as Map<String, dynamic>;
+  final stationFile = File(p.join(stationDirectory, 'station.json'));
+  final targetsFile = File(p.join(stationDirectory, 'targets.json'));
+  final stationBackup = File(
+    p.join(stationDirectory, '.station.json.calibration-backup'),
+  );
+  final targetsBackup = File(
+    p.join(stationDirectory, '.targets.json.calibration-backup'),
+  );
+
+  Future<void> restore(File current, File backup, bool existedBefore) async {
+    if (existedBefore) {
+      if (await backup.exists()) {
+        await _deleteIfExists(current);
+        await backup.rename(current.path);
+      }
+    } else {
+      await _deleteIfExists(current);
+    }
+  }
+
+  await restore(stationFile, stationBackup, metadata['hadStation'] == true);
+  await restore(targetsFile, targetsBackup, metadata['hadTargets'] == true);
+  await _deleteIfExists(
+    File(p.join(stationDirectory, '.station.json.pending')),
+  );
+  await _deleteIfExists(
+    File(p.join(stationDirectory, '.targets.json.pending')),
+  );
+  await pending.delete();
+}
+
+Future<void> _deleteIfExists(File file, {bool ignoreErrors = false}) async {
+  try {
+    if (await file.exists()) await file.delete();
+  } catch (_) {
+    if (!ignoreErrors) rethrow;
+  }
 }
 
 class FileCaptureRepository implements CaptureRepository {
@@ -96,6 +241,16 @@ class FileCaptureRepository implements CaptureRepository {
       flush: true,
     );
   }
+
+  @override
+  Future<void> saveCalibration(
+    CaptureStation station,
+    List<CaptureTarget> targets,
+  ) => persistCaptureCalibrationFiles(
+    stationDirectory: _stationDir(station.stationId),
+    station: station,
+    targets: targets,
+  );
 
   @override
   Future<void> saveRecord(CaptureRecord record) async {
@@ -165,7 +320,13 @@ class FileCaptureRepository implements CaptureRepository {
     // half-written directory from a killed process is not a station.
     final result = <String>[];
     for (final id in ids) {
-      if (await File(p.join(_stationDir(id), 'station.json')).exists()) {
+      final stationDirectory = _stationDir(id);
+      if (await File(
+        p.join(stationDirectory, '.calibration.pending'),
+      ).exists()) {
+        continue;
+      }
+      if (await File(p.join(stationDirectory, 'station.json')).exists()) {
         result.add(id);
       }
     }

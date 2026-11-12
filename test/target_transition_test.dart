@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -32,20 +31,13 @@ import 'capture_flow_test.dart' show bootHarness, calibratedHarness, Harness;
 void main() {
   final radius = const CaptureGeometryConfig().targetRadiusM;
 
-  /// Aims at the active target long enough to satisfy the stability gate and
-  /// fires the shutter through the real button path, then waits for the write
-  /// to land. The wait matters: the shutter is asynchronous file IO, and a
-  /// fixed flush makes the assertion about the machine's load rather than
-  /// about the outcome.
+  /// Aims at the active target long enough for the real automatic gate to arm,
+  /// then waits for the write to land. The wait matters: the shutter is
+  /// asynchronous file IO, and a fixed flush makes the assertion about the
+  /// machine's load rather than about the outcome.
   Future<void> captureActive(Harness harness, {required int id}) async {
     expect(harness.controller.state.activeTargetId, id);
-    await harness.emitStable();
-    // Wait for the emitted poses to be processed before pressing: the stream
-    // delivers asynchronously, and on a loaded machine a fixed flush can
-    // leave the last poses queued — the gate would then read "not stable" and
-    // the iteration would silently capture nothing.
-    await Harness.waitFor(() => harness.controller.state.stable);
-    await harness.controller.captureNow();
+    await harness.holdForAutomaticShutter();
     await Harness.waitFor(
       () =>
           harness.controller.state.targets[id - 1].status !=
@@ -62,15 +54,21 @@ void main() {
   /// The whole arrangement is always in the scene; the active target is the
   /// opaque one and everything else is a ghost, so this is how the test sees
   /// which target is highlighted without reading the controller's mind.
+  ///
+  /// All 26 nodes hang off ONE shared station anchor, so the anchor id cannot
+  /// identify a node. The model matrix can: its translation column is the
+  /// node's own frozen world position, which is what the host draws.
   double activeOpacityFor(Harness harness, int targetId) {
-    final anchorId =
-        harness.controller.state.targets[targetId - 1].anchorIdentifier;
-    if (anchorId == null) return -1;
+    final target = harness.controller.state.targets[targetId - 1];
+    final world = target.anchorWorldPosition;
+    if (target.anchorIdentifier == null || world == null) return -1;
     var max = 0.0;
     for (final draw in harness.gateway.lastScene) {
-      if (draw.anchorId == anchorId && draw.opacity > max) {
-        max = draw.opacity;
-      }
+      final matrix = draw.modelMatrix;
+      if (matrix == null || matrix.length < 15) continue;
+      final node = Vec3(matrix[12], matrix[13], matrix[14]);
+      if ((node - world).length > 1e-5) continue;
+      if (draw.opacity > max) max = draw.opacity;
     }
     return max;
   }
@@ -81,8 +79,8 @@ void main() {
   Vec3 expectedDirection(CaptureTargetSpec spec) =>
       frame.localToWorld(spec.direction).normalized;
 
-  group('the 30-target arrangement', () {
-    test('ids are unique and 1…30, one of each ring', () {
+  group('the 26-target arrangement', () {
+    test('ids are unique and 1…26, one of each ring', () {
       final specs = buildCaptureSphere();
       expect(specs.length, kCaptureTargetCount);
       expect(
@@ -93,8 +91,8 @@ void main() {
       for (final spec in specs) {
         rings[spec.ringName] = (rings[spec.ringName] ?? 0) + 1;
       }
-      // 12 horizontal / 8 upper / 8 lower / 1 zenith / 1 nadir.
-      expect(rings[kMiddleRingName], 12);
+      // 8 horizontal / 8 upper / 8 lower / 1 zenith / 1 nadir.
+      expect(rings[kMiddleRingName], 8);
       expect(rings[kUpperRingName], 8);
       expect(rings[kLowerRingName], 8);
       expect(rings[kZenithRingName], 1);
@@ -127,31 +125,26 @@ void main() {
     });
 
     test('zenith is up and nadir is down', () {
-      // The near-poles sit at ±85°, not the exact poles: y = ±sin(85°), within
-      // 5° of the vertical.
+      // The poles are the exact poles: y = ±1, straight up and down.
       final frame = StationFrame(origin: Vec3.zero, orientation: Quat.identity);
-      final poleY = math.sin(85 * math.pi / 180);
       for (final spec in buildCaptureSphere()) {
         final dir = frame.localToWorld(spec.direction).normalized;
-        if (spec.isZenith) expect(dir.y, closeTo(poleY, 1e-9));
-        if (spec.isNadir) expect(dir.y, closeTo(-poleY, 1e-9));
+        if (spec.isZenith) expect(dir.y, closeTo(1, 1e-9));
+        if (spec.isNadir) expect(dir.y, closeTo(-1, 1e-9));
       }
     });
 
     test(
-      'calibration places all 30 nodes at once, each at its own position',
+      'calibration places all 26 nodes at once, each at its own position',
       () async {
         // The whole arrangement is created in one pass, before the first
-        // photograph: 30 anchors, 30 distinct positions, no raycast, no shared
-        // node — and none of it re-done when a target is selected.
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: false,
-        );
+        // photograph: ONE station anchor, 26 distinct node positions, no
+        // raycast — and none of it re-done when a target is selected.
+        final harness = await calibratedHarness(autoAdvance: false);
         final specs = buildCaptureSphere();
 
-        expect(harness.gateway.anchorCreations, kCaptureTargetCount);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
+        expect(harness.gateway.anchorCreations, 1);
+        expect(harness.gateway.anchors.length, 1);
         expect(
           harness.gateway.raycastCalls,
           0,
@@ -176,15 +169,12 @@ void main() {
           expect(target.anchorSurfaceType, 'WORLD');
           ids.add(target.anchorIdentifier!);
         }
-        expect(ids.length, kCaptureTargetCount, reason: '30 distinct nodes');
+        expect(ids.length, 1, reason: 'all 26 nodes share one station anchor');
       },
     );
 
     test('selecting a target touches no node', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: false,
-      );
+      final harness = await calibratedHarness(autoAdvance: false);
       final before = harness.gateway.anchorCreations;
       final sceneBefore = harness.gateway.lastScene;
 
@@ -197,7 +187,7 @@ void main() {
         before,
         reason: 'selection is a highlight, never a placement',
       );
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchors.length, 1);
       // The scene changed only in which target is highlighted: same node set,
       // target 9 now the opaque one.
       expect(harness.gateway.lastScene.length, sceneBefore.length);
@@ -210,10 +200,7 @@ void main() {
     test(
       'capturing target 1 activates target 2, placed at its own position',
       () async {
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: true,
-        );
+        final harness = await calibratedHarness(autoAdvance: true);
         expect(harness.controller.state.activeTargetId, 1);
         final firstAnchor =
             harness.controller.state.targets[0].anchorIdentifier!;
@@ -228,16 +215,24 @@ void main() {
         expect(state.capturedCount, 1);
         expect(harness.gateway.stillRequests, 1);
 
-        // Target 2 was already placed at calibration and keeps its own node:
-        // accepting target 1 neither recreated nor released anything.
+        // Target 2 was already placed at calibration and keeps its own node on
+        // the SAME shared station anchor: accepting target 1 neither recreated
+        // nor released anything.
         final second = state.targets[1];
         expect(second.anchorIdentifier, isNotNull);
-        expect(second.anchorIdentifier, isNot(firstAnchor));
+        expect(second.anchorIdentifier, firstAnchor);
         expect(second.anchorWorldPosition, isNotNull);
         final expected = expectedPosition(buildCaptureSphere()[1]);
         expect(second.anchorWorldPosition!.x, closeTo(expected.x, 1e-9));
         expect(second.anchorWorldPosition!.y, closeTo(expected.y, 1e-9));
         expect(second.anchorWorldPosition!.z, closeTo(expected.z, 1e-9));
+        // A shared anchor is not a shared position: the two nodes are still
+        // distinct points on the sphere.
+        expect(
+          (second.anchorWorldPosition! - state.targets[0].anchorWorldPosition!)
+              .length,
+          greaterThan(1e-3),
+        );
         // The highlight moved: target 2 is the opaque node now, and target 1
         // — finished — is omitted from the scene entirely rather than left
         // drawn over the photograph it just took.
@@ -248,8 +243,8 @@ void main() {
         );
         expect(
           harness.gateway.anchors.length,
-          kCaptureTargetCount,
-          reason: 'nor release one',
+          1,
+          reason: 'nor release the one shared station anchor',
         );
         expect(activeOpacityFor(harness, 2), 1);
         expect(activeOpacityFor(harness, 1), 0);
@@ -260,10 +255,7 @@ void main() {
     );
 
     test('the arrow aims at the new target, not at the released one', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
       await captureActive(harness, id: 1);
       expect(harness.controller.state.activeTargetId, 2);
 
@@ -278,10 +270,7 @@ void main() {
     });
 
     test('capturing target 2 activates target 3', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
       await captureActive(harness, id: 1);
       expect(harness.controller.state.activeTargetId, 2);
       await captureActive(harness, id: 2);
@@ -291,16 +280,13 @@ void main() {
       expect(state.targets[1].status, CaptureTargetStatus.captured);
       expect(state.targets[2].anchorIdentifier, isNotNull);
       expect(state.capturedCount, 2);
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchors.length, 1);
     });
 
     test(
-      'all 30 captures complete on one session, one anchor each',
+      'all 26 captures complete on one session, one shared anchor',
       () async {
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: true,
-        );
+        final harness = await calibratedHarness(autoAdvance: true);
         for (var id = 1; id <= kCaptureTargetCount; id++) {
           expect(
             harness.controller.state.activeTargetId,
@@ -314,11 +300,11 @@ void main() {
         expect(state.phase, CapturePhase.complete);
         expect(state.capturedCount, kCaptureTargetCount);
         expect(harness.gateway.stillRequests, kCaptureTargetCount);
-        // One anchor per target for the whole sequence — the arrangement was
+        // One shared anchor for the whole sequence — the arrangement was
         // created once at calibration and never rebuilt — and the last target
         // does not wrap back to target 1.
-        expect(harness.gateway.anchorCreations, kCaptureTargetCount);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
+        expect(harness.gateway.anchorCreations, 1);
+        expect(harness.gateway.anchors.length, 1);
         expect(state.station, isNotNull);
 
         // The last completion leaves no active target, no alignment and no
@@ -345,7 +331,7 @@ void main() {
         expect(reopened.targets.last.status, CaptureTargetStatus.active);
         expect(reopened.capturedCount, kCaptureTargetCount - 1);
       },
-      // 30 frames each write and read back a real JPEG. Alone that is a few
+      // 26 frames each write and read back a real JPEG. Alone that is a few
       // seconds; the default 30 s budget expires when the whole suite runs the
       // files in parallel on a loaded machine.
       timeout: const Timeout(Duration(minutes: 3)),
@@ -368,7 +354,7 @@ void main() {
   group('a pose that arrives mid-placement', () {
     test('neither duplicates a node nor loses the arrangement', () async {
       // Freeze the calibration pass at its very first anchor creation.
-      final harness = await bootHarness(autoCapture: false);
+      final harness = await bootHarness();
       await harness.emit();
       final gate = Completer<void>();
       harness.gateway.anchorGate = gate.future;
@@ -395,8 +381,8 @@ void main() {
 
       // Exactly 26 nodes, no duplicates, nothing lost — and the mid-flight
       // pose started no placement of its own.
-      expect(harness.gateway.anchorCreations, kCaptureTargetCount);
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchorCreations, 1);
+      expect(harness.gateway.anchors.length, 1);
       final state = harness.controller.state;
       expect(state.activeTargetId, 1);
       expect(state.activeAnchored, isTrue);
@@ -412,40 +398,39 @@ void main() {
     });
 
     test(
-      'a selection during a recovery queues, and the later one wins',
+      'a selection during a placement queues, and the later one wins',
       () async {
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: true,
-        );
+        final harness = await calibratedHarness(autoAdvance: true);
         final before = harness.gateway.anchorCreations;
 
-        // ARCore drops the active target's anchor; the refresh starts the
-        // bounded recovery, which parks on the gate.
-        final activeId =
-            harness.controller.state.activeTarget!.anchorIdentifier!;
-        harness.gateway.dropAnchor(activeId);
+        // A recalibration is the placement a selection can now collide with:
+        // all 26 nodes are created in one pass on one shared station anchor, so
+        // there is no per-target placement left to interleave with. Park that
+        // pass on the host's anchor gate.
         final gate = Completer<void>();
         harness.gateway.anchorGate = gate.future;
-        harness.now = harness.now.add(const Duration(milliseconds: 600));
-        harness.gateway.emitPose(
-          position: Vec3.zero,
-          worldOrientation: Quat.identity,
-        );
+        await harness.emit();
+        final recalibration = harness.controller.recalibrateHere();
         await Harness.flush();
 
-        // The user picks another target while the recovery is in flight.
+        // The user picks another target while the placement is in flight.
         final selection = harness.controller.selectTarget(3);
         await Harness.flush();
+        expect(
+          harness.controller.state.activeTargetId,
+          isNot(3),
+          reason: 'the selection must wait for the placement, not interleave',
+        );
 
         gate.complete();
+        await recalibration;
         await selection;
         await Harness.flush();
 
         final state = harness.controller.state;
-        // The recovery re-placed exactly the one dropped target…
+        // The placement created exactly one new shared station anchor…
         expect(harness.gateway.anchorCreations, before + 1);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
+        expect(harness.gateway.anchors.length, 1);
         // …the queued selection then ran, and the later request won.
         expect(state.activeTargetId, 3);
         expect(state.activeAnchored, isTrue);
@@ -455,10 +440,7 @@ void main() {
 
     test('a stale refresh answer is discarded, not written onto the new '
         'target', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
       // Open a refresh of the active target's anchor, as the twice-a-second
       // re-read would, and leave it unanswered while the user moves on.
       final refreshGate = Completer<void>();
@@ -492,10 +474,10 @@ void main() {
       );
       expect(
         harness.gateway.anchorCreations,
-        kCaptureTargetCount,
+        1,
         reason: 'no recovery was started by the stale answer',
       );
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchors.length, 1);
       expect(state.activeAnchored, isTrue);
       expect(state.activeAnchorTracking, isTrue);
 
@@ -510,10 +492,7 @@ void main() {
     test(
       'two overlapping selections place nothing and highlight the later one',
       () async {
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: true,
-        );
+        final harness = await calibratedHarness(autoAdvance: true);
         final creations = harness.gateway.anchorCreations;
 
         // Two selections in the same event-loop turn: neither places anything,
@@ -527,7 +506,7 @@ void main() {
         final state = harness.controller.state;
         expect(state.activeTargetId, 3, reason: 'the later request wins');
         expect(harness.gateway.anchorCreations, creations);
-        expect(harness.gateway.anchors.length, kCaptureTargetCount);
+        expect(harness.gateway.anchors.length, 1);
         expect(activeOpacityFor(harness, 3), 1);
         expect(activeOpacityFor(harness, 2), lessThan(1));
       },
@@ -539,7 +518,6 @@ void main() {
     test('keeps the target active and does not advance', () async {
       final harness = await calibratedHarness(
         stillError: const ArCoreFailure('Fake: no camera image.'),
-        autoCapture: false,
         autoAdvance: true,
       );
       final anchor = harness.controller.state.targets[0].anchorIdentifier;
@@ -555,12 +533,12 @@ void main() {
       expect(state.activeAnchored, isTrue);
       expect(
         harness.gateway.anchors.length,
-        kCaptureTargetCount,
+        1,
         reason: 'the whole arrangement survives a failed capture',
       );
       expect(
         harness.gateway.anchorCreations,
-        kCaptureTargetCount,
+        1,
         reason: 'no re-placement was started',
       );
       // The GLB is still in the scene, on the same anchor.
@@ -574,19 +552,17 @@ void main() {
     test('bytes that are not a photograph do not advance either', () async {
       final harness = await calibratedHarness(
         stillBytes: Uint8List.fromList(const <int>[1, 2, 3]),
-        autoCapture: false,
         autoAdvance: true,
       );
       await captureActive(harness, id: 1);
       expect(harness.controller.state.activeTargetId, 1);
       expect(harness.controller.state.capturedCount, 0);
-      expect(harness.gateway.anchorCreations, kCaptureTargetCount);
+      expect(harness.gateway.anchorCreations, 1);
     });
 
     test('a retry replaces the anchor once and then advances', () async {
       final harness = await calibratedHarness(
         stillError: const ArCoreFailure('Fake: no camera image.'),
-        autoCapture: false,
         autoAdvance: true,
       );
       await captureActive(harness, id: 1);
@@ -603,7 +579,7 @@ void main() {
         creations,
         reason: 'a retry re-uses the placed node',
       );
-      expect(harness.gateway.anchors.length, kCaptureTargetCount);
+      expect(harness.gateway.anchors.length, 1);
 
       await captureActive(harness, id: 1);
       expect(harness.controller.state.activeTargetId, 2);
@@ -622,7 +598,6 @@ void main() {
     test('a failed capture is persisted, not only shown', () async {
       final harness = await calibratedHarness(
         stillError: const ArCoreFailure('Fake: no camera image.'),
-        autoCapture: false,
         autoAdvance: true,
       );
       await captureActive(harness, id: 1);
@@ -634,10 +609,7 @@ void main() {
     });
 
     test('a retake persists the decremented station count', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
       await captureActive(harness, id: 1);
       expect(harness.repository.stations['s1']!.capturedCount, 1);
 
@@ -678,13 +650,12 @@ void main() {
         expect(face.z, closeTo(facing.z, 1e-9));
 
         if (spec.isZenith || spec.isNadir) {
-          // Not the degenerate identity rotation: a near-pole plate faces
-          // almost straight down (zenith) or up (nadir) — a ~85° turn about a
-          // horizontal axis — so its face is within 5° of ±Y and nowhere near
-          // the +Z a flat-on plate would use.
+          // Not the degenerate identity rotation: a pole plate faces straight
+          // down (zenith) or up (nadir) — a 90° turn about a horizontal axis —
+          // so its face is exactly ±Y with no +Z component at all.
           final up = spec.isZenith ? -1.0 : 1.0;
-          expect(face.y * up, greaterThan(0.99));
-          expect(face.dot(Vec3.unitZ).abs(), lessThan(0.09));
+          expect(face.y * up, closeTo(1, 1e-9));
+          expect(face.dot(Vec3.unitZ).abs(), lessThan(1e-9));
         }
       }
     });

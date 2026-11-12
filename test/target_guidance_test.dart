@@ -19,51 +19,59 @@ import 'capture_flow_test.dart' show calibratedHarness, Harness;
 /// incomplete targets. A ring at 100% without a saved photograph must not
 /// advance anything, and a late or repeated completion must not skip a target.
 void main() {
-  /// Selects [id], holds the aim until the stability window elapses, and fires
-  /// the shutter through the controller's real capture path.
-  ///
-  /// `captureNow` awaits the whole transaction, including the completion
-  /// transition and the next selection, so assertions can run immediately
-  /// afterwards.
+  /// Selects [id] and holds the aim until the real automatic shutter fires and
+  /// its transaction — including the completion transition and the next
+  /// selection — has settled, so assertions can run immediately afterwards.
   Future<void> aimAndCapture(Harness harness, int id) async {
     await harness.controller.selectTarget(id);
     await Harness.flush();
-    await harness.emitStable(count: 20);
-    await Harness.waitFor(() => harness.controller.state.stable);
-    await harness.controller.captureNow();
-    await Harness.flush();
+    // A deliberate move off the target first. This is what re-aiming means to
+    // the controller: it breaks the stability window and clears a latched
+    // failure, so a retry is a fresh alignment episode rather than a loop.
+    await harness.emit(orientation: Quat.axisAngle(90, Vec3.unitY));
+    await harness.holdForAutomaticShutter();
   }
 
   group('alignment is not completion', () {
-    test('a full ring without a photograph does not advance', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+    test('a full ring without a saved photograph does not advance', () async {
+      final harness = await calibratedHarness(autoAdvance: true);
       await harness.controller.selectTarget(1);
-      await harness.emitStable(count: 20);
-      await Harness.waitFor(() => harness.controller.state.stable);
+
+      // Hold the photograph in flight. With only one shutter, the instant the
+      // ring fills IS the instant it fires — so the window in which "aligned
+      // and steady" is true while no photograph exists is the save itself.
+      // This is the invariant that matters: the ring is not the completion.
+      final gate = Completer<void>();
+      harness.gateway.stillGate = gate.future;
+      await harness.emitUntilShutterArms();
 
       final state = harness.controller.state;
       expect(state.alignment, isNotNull);
       expect(state.alignment!.withinTolerance, isTrue);
       expect(state.stable, isTrue);
-      expect(state.ringComplete, isTrue);
-      expect(state.readyToCapture, isTrue);
+      expect(harness.gateway.stillRequests, 1);
 
-      // Ready to shoot is still the same target, with no photograph and no
-      // advancement.
+      // Aligned, steady, shot requested — and still the same target, with no
+      // photograph and no advancement.
       expect(state.activeTargetId, 1);
       expect(state.guidanceTarget?.targetId, 1);
-      expect(state.targets[0].status, CaptureTargetStatus.active);
+      expect(state.targets[0].status, isNot(CaptureTargetStatus.captured));
+      expect(state.targets[0].imagePath, isNull);
       expect(state.capturedCount, 0);
-      expect(harness.gateway.stillRequests, 0);
+
+      // Only the saved record completes it.
+      gate.complete();
+      await Harness.waitFor(() => harness.controller.state.capturedCount == 1);
+      expect(
+        harness.controller.state.targets[0].status,
+        CaptureTargetStatus.captured,
+      );
+      expect(harness.controller.state.activeTargetId, 2);
     });
 
     test('a failed photograph keeps the target active and guided', () async {
       final harness = await calibratedHarness(
         stillError: const ArCoreFailure('Fake: no camera image.'),
-        autoCapture: false,
         autoAdvance: true,
       );
 
@@ -90,13 +98,10 @@ void main() {
     test(
       'the completed target is replaced by the next incomplete one',
       () async {
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: true,
-        );
-        final firstAnchor =
-            harness.controller.state.targets[0].anchorIdentifier;
-        expect(firstAnchor, isNotNull);
+        final harness = await calibratedHarness(autoAdvance: true);
+        final firstNode =
+            harness.controller.state.targets[0].anchorWorldPosition!;
+        expect(firstNode, isNotNull);
 
         await aimAndCapture(harness, 1);
 
@@ -107,10 +112,16 @@ void main() {
         expect(state.activeTargetId, 2);
         expect(state.guidanceTarget?.targetId, 2);
 
-        // The finished target is gone from the renderer's scene, not merely
-        // faded, and the new target is the one that is placed and guided.
+        // The finished target's node is gone from the renderer's scene, not
+        // merely faded, and the new target is the one that is placed and
+        // guided. Its shared station anchor stays — the other 25 nodes need it —
+        // so the node is identified by its own world position.
         expect(
-          harness.gateway.lastScene.any((draw) => draw.anchorId == firstAnchor),
+          harness.gateway.lastScene.any((draw) {
+            final m = draw.modelMatrix;
+            if (m == null || m.length < 15) return false;
+            return (Vec3(m[12], m[13], m[14]) - firstNode).length < 1e-5;
+          }),
           isFalse,
           reason: 'a captured target must not keep its active marker',
         );
@@ -118,8 +129,10 @@ void main() {
         expect(state.activeAnchorTracking, isTrue);
 
         // The new target starts clean: the previous target's 0° alignment and
-        // full stability window are not carried over.
-        expect(state.alignment, isNull);
+        // full stability window are not carried over. The aim that just
+        // completed target 1 is 45° off target 2, and that is exactly what the
+        // fresh alignment says.
+        expect(state.alignment!.angularErrorDeg, closeTo(45, 0.5));
         expect(state.stable, isFalse);
         expect(state.stabilityProgress, 0);
         expect(state.targets[1].status, CaptureTargetStatus.active);
@@ -138,10 +151,7 @@ void main() {
     );
 
     test('the arrow is aimed at the new target', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
       await aimAndCapture(harness, 1);
       expect(harness.controller.state.activeTargetId, 2);
 
@@ -165,10 +175,7 @@ void main() {
     });
 
     test('next selection skips completed targets in list order', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
 
       await aimAndCapture(harness, 2);
       expect(harness.controller.state.activeTargetId, 3);
@@ -187,10 +194,7 @@ void main() {
     test(
       'retake is the explicit reset that makes it selectable again',
       () async {
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: true,
-        );
+        final harness = await calibratedHarness(autoAdvance: true);
         await aimAndCapture(harness, 1);
         await aimAndCapture(harness, 2);
         expect(harness.controller.state.capturedCount, 2);
@@ -215,22 +219,27 @@ void main() {
 
   group('duplicate and interrupted events', () {
     test(
-      'a second shutter press inside the save does not skip a target',
+      'eligible frames arriving inside the save do not skip a target',
       () async {
-        final harness = await calibratedHarness(
-          autoCapture: false,
-          autoAdvance: true,
-        );
+        final harness = await calibratedHarness(autoAdvance: true);
         await harness.controller.selectTarget(1);
-        await harness.emitStable(count: 20);
-        await Harness.waitFor(() => harness.controller.state.stable);
 
-        // Both presses land inside the same transaction. The latch must let
-        // exactly one reach the camera and advance by exactly one target.
-        await Future.wait<void>([
-          harness.controller.captureNow(),
-          harness.controller.captureNow(),
-        ]);
+        // Hold the write open, then keep the pose aimed and steady. Every one
+        // of these frames re-evaluates the gate, so the in-flight latch is the
+        // only thing standing between them and a second photograph. Three
+        // frames — not twenty: the save refuses a photograph older than 250 ms
+        // from its armed frame, and that freshness gate is real, so the frames
+        // must stay inside it rather than blow past it.
+        final gate = Completer<void>();
+        harness.gateway.stillGate = gate.future;
+        await harness.emitUntilShutterArms();
+        await harness.emitStable(count: 3);
+        expect(harness.gateway.stillRequests, 1);
+
+        gate.complete();
+        await Harness.waitFor(
+          () => harness.controller.state.capturedCount == 1,
+        );
         await Harness.flush();
 
         final state = harness.controller.state;
@@ -243,14 +252,14 @@ void main() {
     );
 
     test('losing tracking neither completes nor advances', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
       await harness.controller.selectTarget(1);
-      await harness.emitStable(count: 20);
-      await Harness.waitFor(() => harness.controller.state.stable);
-      expect(harness.controller.state.readyToCapture, isTrue);
+      // Aligned, but short of the 600 ms hold: the shutter has not armed yet,
+      // which is the only honest way to observe a tracking loss before a
+      // photograph exists now that the gate fires by itself.
+      await harness.emitStable(count: 5);
+      expect(harness.controller.state.alignment!.withinTolerance, isTrue);
+      expect(harness.gateway.stillRequests, 0);
 
       await harness.emit(tracking: TrackingState.paused);
 
@@ -261,35 +270,30 @@ void main() {
       expect(state.capturedCount, 0);
       expect(state.alignment, isNull);
       expect(harness.gateway.stillRequests, 0);
-      await harness.controller.captureNow();
+      // Keep holding the paused pose: the gate is evaluated on every frame, so
+      // this is the sustained version of the old manual press.
+      await harness.emitStable(tracking: TrackingState.paused);
       await Harness.flush();
       expect(harness.gateway.stillRequests, 0);
       expect(harness.controller.state.activeTargetId, 1);
     });
 
     test('a selection made during the save survives the completion', () async {
-      final harness = await calibratedHarness(
-        autoCapture: false,
-        autoAdvance: true,
-      );
+      final harness = await calibratedHarness(autoAdvance: true);
       await harness.controller.selectTarget(1);
-      await harness.emitStable(count: 20);
-      await Harness.waitFor(() => harness.controller.state.stable);
 
       // Hold the photograph in flight. This is the window in which the user
       // can still operate the target sheet.
       final gate = Completer<void>();
       harness.gateway.stillGate = gate.future;
-      final capture = harness.controller.captureNow();
-      await Harness.flush();
-      expect(harness.gateway.stillRequests, 1);
+      await harness.emitUntilShutterArms();
 
       await harness.controller.selectTarget(10);
       await Harness.flush();
       expect(harness.controller.state.activeTargetId, 10);
 
       gate.complete();
-      await capture;
+      await Harness.waitFor(() => harness.controller.state.capturedCount == 1);
       await Harness.flush();
 
       final state = harness.controller.state;

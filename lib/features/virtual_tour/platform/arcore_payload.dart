@@ -1,5 +1,4 @@
-import 'package:adaptive_360_capture_app/core/math/vio_sphere_math.dart'
-    as vio;
+import 'package:adaptive_360_capture_app/core/math/vio_sphere_math.dart' as vio;
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/quaternions.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/domain/math/vectors.dart';
 import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types.dart';

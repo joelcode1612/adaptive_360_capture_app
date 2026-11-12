@@ -33,6 +33,7 @@ class TargetAlignmentOverlay extends StatelessWidget {
     required this.withinTolerance,
     required this.stabilityProgress,
     this.captureBlocked = false,
+    this.holdComplete = false,
     required this.anchored,
     required this.poseValid,
     required this.displayFov,
@@ -67,6 +68,9 @@ class TargetAlignmentOverlay extends StatelessWidget {
   /// the native target's amber warning instead of looking ready.
   final bool captureBlocked;
 
+  /// The real hold completed and has authorized the shutter transaction.
+  final bool holdComplete;
+
   /// Whether the target is in the scene: placed, at a known world position.
   ///
   /// A placed anchor ARCore has paused is still drawn — the renderer reads
@@ -98,8 +102,10 @@ class TargetAlignmentOverlay extends StatelessWidget {
     // that keeps the ring from covering more of the preview than it has to.
     // Stack alignment is `center`, so the ring stays on the optical axis at
     // every size.
-    final reticleSize =
-        (MediaQuery.sizeOf(context).shortestSide * 0.25).clamp(80.0, 120.0);
+    final reticleSize = (MediaQuery.sizeOf(context).shortestSide * 0.25).clamp(
+      80.0,
+      120.0,
+    );
     return IgnorePointer(
       child: Stack(
         alignment: Alignment.center,
@@ -109,6 +115,7 @@ class TargetAlignmentOverlay extends StatelessWidget {
             progress: withinTolerance ? stabilityProgress : 0,
             withinTolerance: withinTolerance,
             completed: completed,
+            holdComplete: holdComplete,
             captureBlocked: captureBlocked,
             bezel: bezel,
           ),
@@ -311,6 +318,6 @@ class _ArrowPainter extends CustomPainter {
       old.anchored != anchored ||
       old.poseValid != poseValid ||
       old.displayFov != displayFov ||
+      !identical(old.displayProjectionMatrix, displayProjectionMatrix) ||
       old.reticleSize != reticleSize;
 }
-

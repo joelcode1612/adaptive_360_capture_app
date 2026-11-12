@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -84,7 +85,8 @@ class Harness {
     Vec3 position = Vec3.zero,
     Quat orientation = Quat.identity,
     TrackingState tracking = TrackingState.tracking,
-    ({Vec3 position, TrackingState tracking})? activeAnchorPose,
+    ({Vec3 position, Quat orientation, TrackingState tracking})?
+    activeAnchorPose,
     String? reportedActiveAnchorId,
     bool includeActiveAnchorPose = true,
     Duration advance = const Duration(milliseconds: 16),
@@ -116,6 +118,7 @@ class Harness {
     int count = 14,
     Duration step = const Duration(milliseconds: 60),
     TrackingState tracking = TrackingState.tracking,
+    bool includeActiveAnchorPose = true,
   }) async {
     final at = position ?? Vec3.zero;
     final aim = orientation ?? _aimAtActiveTarget(from: at);
@@ -124,9 +127,59 @@ class Harness {
         position: at,
         orientation: aim,
         tracking: tracking,
+        includeActiveAnchorPose: includeActiveAnchorPose,
         advance: step,
       );
     }
+  }
+
+  /// Holds an aimed, steady pose until the automatic shutter fires, then waits
+  /// for its transaction to settle.
+  ///
+  /// This is what a manual press used to mean. The product has only one shutter
+  /// now — the automatic gate — so a test that wants a photograph has to earn it
+  /// the same way the operator does: hold the pose past the stability window and
+  /// let the gate decide. The wait is bounded, so a gate that never arms fails
+  /// the assertion instead of hanging.
+  Future<void> holdForAutomaticShutter({
+    Vec3? position,
+    Quat? orientation,
+    TrackingState tracking = TrackingState.tracking,
+    int count = 20,
+  }) async {
+    final before = gateway.stillRequests;
+    await emitStable(
+      position: position,
+      orientation: orientation,
+      tracking: tracking,
+      count: count,
+    );
+    await waitFor(
+      () => gateway.stillRequests > before && !controller.state.capturing,
+    );
+    await flush();
+  }
+
+  /// Emits aimed poses one frame at a time until the automatic shutter fires,
+  /// then stops — and pins the still to the pose that armed it.
+  ///
+  /// [emitStable] cannot be used while a photograph is held in flight: it keeps
+  /// emitting after the armed frame, so the still comes back stamped with a
+  /// later pose than the one that armed the shutter, and the save correctly
+  /// refuses a photograph older than its 250 ms freshness limit. Stopping on the
+  /// armed frame and returning exactly that pose is what a real camera does —
+  /// it hands back the frame it was asked to capture, however long its pipeline
+  /// takes.
+  Future<void> emitUntilShutterArms() async {
+    final before = gateway.stillRequests;
+    for (var frames = 0; frames < 40; frames++) {
+      await emit(advance: const Duration(milliseconds: 60));
+      if (gateway.stillRequests > before) {
+        gateway.stillPose = gateway.lastEmittedPose;
+        return;
+      }
+    }
+    throw StateError('the automatic shutter never armed');
   }
 
   /// The camera orientation that looks from [from] at the active target's
@@ -144,7 +197,6 @@ Future<Harness> bootHarness({
   Uint8List? stillBytes,
   Object? stillError,
   bool hostPresent = true,
-  bool autoCapture = true,
   bool autoAdvance = false,
   Object? recordError,
   bool reusedSession = false,
@@ -172,9 +224,7 @@ Future<Harness> bootHarness({
     meshes: FakeMeshSource(),
     clock: () => harness!.now,
     autoAdvance: autoAdvance,
-    // The controller's switch is the `CaptureMode` enum; the harness keeps a
-    // bool because every call site reads `autoCapture: false` as "manual".
-    mode: autoCapture ? CaptureMode.automatic : CaptureMode.manual,
+    mode: CaptureMode.automatic,
   );
   harness = Harness(gateway, repository, controller);
   // The pose stream and the controller share one clock, so the engine's 600 ms
@@ -190,7 +240,6 @@ Future<Harness> calibratedHarness({
   bool surfaceFound = true,
   Uint8List? stillBytes,
   Object? stillError,
-  bool autoCapture = true,
   bool autoAdvance = false,
   Object? recordError,
   bool hostPresent = true,
@@ -201,7 +250,6 @@ Future<Harness> calibratedHarness({
     surfaceFound: surfaceFound,
     stillBytes: stillBytes,
     stillError: stillError,
-    autoCapture: autoCapture,
     autoAdvance: autoAdvance,
     recordError: recordError,
     hostPresent: hostPresent,
@@ -262,10 +310,7 @@ void main() {
     // Every one of the 26 probes reports a miss — ARCore has mapped nothing.
     // Placement must not care: the world position is computed from the
     // station, not discovered from a raycast.
-    final harness = await calibratedHarness(
-      surfaceFound: false,
-      autoCapture: false,
-    );
+    final harness = await calibratedHarness(surfaceFound: false);
 
     final target = harness.controller.state.targets.first;
     expect(target.anchorIdentifier, isNotNull);
@@ -283,7 +328,7 @@ void main() {
   test(
     'placement anchors the target at its calculated world position',
     () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
       await Harness.flush();
 
@@ -308,9 +353,9 @@ void main() {
       expect(target.anchorWorldPosition!.x, closeTo(expectedPosition.x, 1e-9));
       expect(target.anchorWorldPosition!.y, closeTo(expectedPosition.y, 1e-9));
       expect(target.anchorWorldPosition!.z, closeTo(expectedPosition.z, 1e-9));
-      // All 26 nodes, placed once at calibration — and none of them touched
-      // by selecting one target.
-      expect(harness.gateway.anchorCreations, kCaptureTargetCount);
+      // One shared station anchor holds all 26 nodes, placed once at
+      // calibration — and selecting a target does not create another.
+      expect(harness.gateway.anchorCreations, 1);
       // Bezel first, target on top — the order two coplanar meshes need.
       expect(
         harness.gateway.lastScene.first.meshId,
@@ -328,10 +373,14 @@ void main() {
     test(
       'a shared ARCore map correction is not treated as leaving the station',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         final target = harness.controller.state.activeTarget!;
         final anchorId = target.anchorIdentifier!;
-        final placed = target.anchorWorldPosition!;
+        // All 26 nodes hang off ONE station anchor, which sits at the station
+        // origin — not at the target node's own world position. Refining the
+        // node position here would be an anchor-only jump of a whole target
+        // radius, which is a different event from a shared map correction.
+        final placed = harness.controller.state.station!.referencePosition;
         const correction = Vec3(0.26, 0, 0);
 
         // Establish the anchor's first stable position, then reproduce the
@@ -347,6 +396,7 @@ void main() {
           position: correction,
           activeAnchorPose: (
             position: placed + correction,
+            orientation: Quat.identity,
             tracking: TrackingState.tracking,
           ),
           reportedActiveAnchorId: anchorId,
@@ -364,49 +414,74 @@ void main() {
 
     // ── required case 9 ─────────────────────────────────────────────────
     test('invalid tracking prevents capture', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1); // straight ahead
-      await harness.emitStable();
-      expect(harness.controller.state.alignment, isNotNull);
-      expect(harness.controller.state.readyToCapture, isTrue);
 
-      // AR loses tracking.
-      await harness.emit(tracking: TrackingState.paused);
+      // AR loses tracking, and the aimed hold is sustained well past the
+      // stability window. The automatic gate is evaluated on every pose, so
+      // this is the manual "press" translated into the only shutter the
+      // product still has.
+      await harness.emitStable(tracking: TrackingState.paused, count: 20);
       expect(harness.controller.state.readyToCapture, isFalse);
       expect(harness.controller.state.captureBlockReason, contains('tracking'));
-      await harness.controller.captureNow();
-      await Harness.flush();
       expect(harness.gateway.stillRequests, 0);
       expect(harness.controller.state.capturedCount, 0);
+
+      // Tracking returns and the same hold now earns a real photograph. That
+      // is what makes the refusal above a gate rather than a dead end. The
+      // hold is longer than a normal one because recovery is two holds, not
+      // one: 600 ms proving the station reference is continuous, then a fresh
+      // 600 ms capture window.
+      await harness.holdForAutomaticShutter(count: 40);
+      expect(harness.gateway.stillRequests, 1);
+      expect(harness.controller.state.capturedCount, 1);
+      // The photograph cleared the guidance: with auto-advance off there is no
+      // active target, so there is honestly nothing to aim at.
+      expect(
+        harness.controller.state.targets[0].status,
+        CaptureTargetStatus.captured,
+      );
+      expect(harness.controller.state.alignment, isNull);
     });
 
     test('an unplaced target cannot be captured', () async {
       // Placement happens once, at calibration. The only way a target is
       // unplaced is AR refusing its world anchor during that pass — so the
       // refusal is armed before calibration, not after it.
-      final harness = await bootHarness(autoCapture: false);
+      final harness = await bootHarness();
       await harness.emit();
       harness.gateway.refuseAnchors = true;
       await harness.controller.calibrateStation(stationId: 's1');
       await Harness.flush();
 
+      // Calibration is atomic: one shared anchor carries all 26 directions,
+      // so a refused anchor means there is no station and no arrangement —
+      // not a station with 26 unplaced rows pretending to be usable.
+      expect(harness.controller.state.station, isNull);
+      expect(harness.controller.state.targets, isEmpty);
       expect(harness.controller.state.activeAnchored, isFalse);
-      expect(harness.controller.state.targets[0].anchorIdentifier, isNull);
-      expect(harness.controller.state.activeTargetId, 1);
       expect(harness.controller.state.readyToCapture, isFalse);
       expect(
         harness.controller.state.captureBlockReason,
-        contains('Scan again'),
+        contains('retry calibration'),
       );
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.emitStable();
       expect(harness.gateway.stillRequests, 0);
       // Nothing claimed to be placed: the whole pass failed, honestly.
       expect(harness.gateway.anchorCreations, 0);
+
+      // And it is retryable: with AR accepting anchors again, the same call
+      // produces a real station and the full arrangement.
+      harness.gateway.refuseAnchors = false;
+      await harness.controller.calibrateStation(stationId: 's1');
+      await Harness.flush();
+      expect(harness.controller.state.station, isNotNull);
+      expect(harness.controller.state.targets.length, kCaptureTargetCount);
+      expect(harness.gateway.anchorCreations, 1);
     });
 
     test('a pose outside tolerance is not ready', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
       // Turn to face the opposite way: 180° of error.
       await harness.emit(orientation: orientationFor(const Vec3(0, 0, -1)));
@@ -415,8 +490,9 @@ void main() {
         greaterThan(3),
       );
       expect(harness.controller.state.readyToCapture, isFalse);
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.emitStable(
+        orientation: orientationFor(const Vec3(0, 0, -1)),
+      );
       expect(harness.gateway.stillRequests, 0);
     });
 
@@ -460,12 +536,9 @@ void main() {
       () async {
         final harness = await calibratedHarness(
           stillError: const ArCoreFailure('Fake: no camera image.'),
-          autoCapture: false,
         );
         await harness.controller.selectTarget(1);
-        await harness.emitStable();
-        await harness.controller.captureNow();
-        await Harness.flush();
+        await harness.holdForAutomaticShutter();
 
         expect(harness.gateway.stillRequests, 1);
         expect(
@@ -484,12 +557,9 @@ void main() {
       () async {
         final harness = await calibratedHarness(
           stillBytes: Uint8List.fromList(const <int>[1, 2, 3]),
-          autoCapture: false,
         );
         await harness.controller.selectTarget(1);
-        await harness.emitStable();
-        await harness.controller.captureNow();
-        await Harness.flush();
+        await harness.holdForAutomaticShutter();
 
         expect(
           harness.controller.state.targets[0].status,
@@ -505,12 +575,9 @@ void main() {
       () async {
         final harness = await calibratedHarness(
           recordError: StateError('disk full'),
-          autoCapture: false,
         );
         await harness.controller.selectTarget(1);
-        await harness.emitStable();
-        await harness.controller.captureNow();
-        await Harness.flush();
+        await harness.holdForAutomaticShutter();
 
         expect(harness.repository.saveRecordCalls, 1);
         expect(
@@ -525,12 +592,9 @@ void main() {
     test('can be retried, and the retry succeeds', () async {
       final harness = await calibratedHarness(
         stillError: const ArCoreFailure('Fake: no camera image.'),
-        autoCapture: false,
       );
       await harness.controller.selectTarget(1);
-      await harness.emitStable();
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.holdForAutomaticShutter();
       expect(
         harness.controller.state.targets[0].status,
         CaptureTargetStatus.failed,
@@ -538,9 +602,9 @@ void main() {
 
       harness.gateway.stillError = null;
 
-      // The retry latch stays on until the user deliberately re-aims, so a
-      // second press without moving is refused rather than firing again.
-      await harness.controller.captureNow();
+      // The retry latch stays on until the user deliberately re-aims, so
+      // continuing to hold the same aligned pose must not fire a second shot.
+      await harness.emitStable(count: 20);
       await Harness.flush();
       expect(
         harness.controller.state.targets[0].status,
@@ -554,9 +618,7 @@ void main() {
 
       // Breaking the hold and aiming again re-arms the shutter.
       await harness.emit(orientation: Quat.axisAngle(90, Vec3.unitY));
-      await harness.emitStable();
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.holdForAutomaticShutter();
       expect(
         harness.controller.state.targets[0].status,
         CaptureTargetStatus.captured,
@@ -568,11 +630,9 @@ void main() {
   // ── required case 12 ──────────────────────────────────────────────────
   group('a successful save', () {
     test('updates only the station and target it belongs to', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
-      await harness.emitStable();
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.holdForAutomaticShutter();
 
       final targets = harness.controller.state.targets;
       expect(targets[0].status, CaptureTargetStatus.captured);
@@ -594,11 +654,9 @@ void main() {
     });
 
     test('writes a file that exists and reads back byte for byte', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
-      await harness.emitStable();
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.holdForAutomaticShutter();
 
       final path = harness.controller.state.targets[0].imagePath!;
       final bytes = await readCaptureImage(path);
@@ -611,18 +669,14 @@ void main() {
     test(
       'a second target adds a second record and leaves the first alone',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         await harness.controller.selectTarget(1);
-        await harness.emitStable();
-        await harness.controller.captureNow();
-        await Harness.flush();
+        await harness.holdForAutomaticShutter();
         final firstPath = harness.controller.state.targets[0].imagePath;
 
         await harness.controller.selectTarget(10);
         await Harness.flush();
-        await harness.emitStable();
-        await harness.controller.captureNow();
-        await Harness.flush();
+        await harness.holdForAutomaticShutter();
 
         final targets = harness.controller.state.targets;
         expect(targets[0].imagePath, firstPath);
@@ -639,16 +693,12 @@ void main() {
 
   group('retake', () {
     test('clears one target without touching the others', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
-      await harness.emitStable();
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.holdForAutomaticShutter();
       await harness.controller.selectTarget(10);
       await Harness.flush();
-      await harness.emitStable();
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.holdForAutomaticShutter();
       expect(harness.controller.state.capturedCount, 2);
 
       await harness.controller.retake(1);
@@ -664,7 +714,7 @@ void main() {
 
   group('app lifecycle', () {
     test('resuming a reused session restores the capture phase', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       expect(harness.controller.state.phase, CapturePhase.capturing);
 
       // Same AR session, same world origin — the station is still valid.
@@ -683,7 +733,7 @@ void main() {
     });
 
     test('resuming a restarted session asks for recalibration', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       expect(harness.controller.state.station, isNotNull);
 
       // A fresh session has a new ARCore world origin; the old station pose
@@ -700,7 +750,7 @@ void main() {
     test(
       'a second boot does not leave two pose subscriptions running',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         await harness.controller.onAppResumed(width: 720, height: 1280);
         await Harness.flush();
 
@@ -716,14 +766,15 @@ void main() {
     test(
       'a failed second boot reports the thrown failure and stays inert',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         expect(harness.controller.state.phase, CapturePhase.capturing);
 
         // The second boot is the pause/resume path. This resume's start fails
         // the way a real broken session start does: a thrown failure, not a
         // silently absent session.
-        harness.gateway.startError =
-            const ArCoreFailure('Fake: ARCore session could not start.');
+        harness.gateway.startError = const ArCoreFailure(
+          'Fake: ARCore session could not start.',
+        );
         await harness.controller.onAppPaused();
         await harness.controller.onAppResumed(width: 720, height: 1280);
         await Harness.flush();
@@ -750,7 +801,7 @@ void main() {
     test(
       'dispose stops the session once and leaves no listener behind',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         harness.controller.dispose();
         await Harness.flush();
 
@@ -770,8 +821,14 @@ void main() {
     );
 
     test('a rewound stamp refuses the pose and the gate re-arms', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
+
+      // The stability window is the subject, so the photograph it arms is held
+      // open: in automatic mode a steady aimed hold *is* the shutter, and
+      // letting the write land would move the test on to target 2 mid-window.
+      final write = Completer<void>();
+      harness.gateway.stillGate = write.future;
 
       // A normal stream walks the window: fourteen poses, 60 ms apart.
       await harness.emitStable(count: 14);
@@ -796,6 +853,9 @@ void main() {
       await Harness.flush();
       expect(harness.controller.state.stable, isTrue);
       expect(harness.controller.state.stabilityRejection, isNot('timestamp'));
+
+      write.complete();
+      await Harness.flush();
     });
   });
 
@@ -803,7 +863,7 @@ void main() {
     test(
       're-arms the host, drops the anchor and re-places the target',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         await harness.controller.selectTarget(1);
         await Harness.flush();
         expect(harness.controller.state.activeAnchored, isTrue);
@@ -821,10 +881,7 @@ void main() {
     test(
       'says why it cannot place a target while tracking is paused',
       () async {
-        final harness = await calibratedHarness(
-          surfaceFound: false,
-          autoCapture: false,
-        );
+        final harness = await calibratedHarness(surfaceFound: false);
         await harness.emit(tracking: TrackingState.paused);
         await harness.controller.rescanActive();
         await Harness.flush();
@@ -836,11 +893,9 @@ void main() {
     );
 
     test('never touches an already captured photograph', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
-      await harness.emitStable();
-      await harness.controller.captureNow();
-      await Harness.flush();
+      await harness.holdForAutomaticShutter();
       final path = harness.controller.state.targets[0].imagePath;
       expect(path, isNotNull);
 
@@ -858,7 +913,7 @@ void main() {
 
   group('a fatal render failure', () {
     test('is surfaced with its class, message and origin', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       harness.gateway.emitFault(
         'java.lang.IllegalArgumentException: Must use a native order direct '
         'buffer',
@@ -887,7 +942,7 @@ void main() {
     test(
       'a non-fatal error is a diagnostics line, not a fault banner',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         harness.gateway.emitFault('a transient hiccup', fatal: false);
         await Harness.flush();
 
@@ -943,15 +998,16 @@ void main() {
 
   // ── the motion pipeline, end to end ────────────────────────────────────
   group('smoothing, concurrency and diagnostics', () {
-    test('two concurrent capture requests produce one photograph', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+    test('a long eligible hold produces one photograph, not one per frame', () async {
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
-      await harness.emitStable();
 
-      // Both fired in the same event-loop turn, as a double tap would.
-      final first = harness.controller.captureNow();
-      final second = harness.controller.captureNow();
-      await Future.wait(<Future<void>>[first, second]);
+      // The gate is evaluated on every pose and the shutter is fire-and-forget,
+      // so dozens of eligible frames arrive while the first JPEG is still being
+      // written. `_shoot` takes its latch synchronously before its first await;
+      // this is the automatic equivalent of the old double-tap test.
+      await harness.emitStable(count: 60);
+      await Harness.waitFor(() => harness.controller.state.capturedCount == 1);
       await Harness.flush();
 
       expect(harness.gateway.stillRequests, 1);
@@ -963,7 +1019,7 @@ void main() {
     });
 
     test('the arrow and the shutter read one alignment, not two', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
       await harness.emit(); // aimed: the smoother takes its first sample
 
@@ -983,16 +1039,13 @@ void main() {
       // not to anything that aims. The filtered copy of this very sample lags,
       // which is exactly what the arrow must no longer inherit.
       final turning = harness.controller.diagnostics.entries.last;
-      expect(
-        turning.filtered.maxComponentDiff(turning.raw),
-        greaterThan(1e-6),
-      );
+      expect(turning.filtered.maxComponentDiff(turning.raw), greaterThan(1e-6));
     });
 
     test(
       'losing tracking clears the guidance instead of smearing across the gap',
       () async {
-        final harness = await calibratedHarness(autoCapture: false);
+        final harness = await calibratedHarness();
         await harness.controller.selectTarget(1);
         await harness.emit();
         harness.now = harness.now.add(const Duration(milliseconds: 60));
@@ -1008,28 +1061,38 @@ void main() {
         harness.now = harness.now.add(const Duration(milliseconds: 60));
         await harness.emit(orientation: Quat.fromYawPitch(6, 0));
 
-        // The recovery reads the pose reported now: 6° off, and the record's
-        // filtered orientation is that same pose rather than a blend with the
-        // one held before the interruption.
+        // The resumed frame is measured, not published: the station reference
+        // still has to prove it is continuous, so guidance stays suppressed
+        // and no turn is issued from a pose that may belong to a new map.
+        expect(harness.controller.state.alignment, isNull);
+        expect(harness.controller.state.trackingRecovering, isTrue);
         expect(
-          harness.controller.state.alignment!.angularErrorDeg,
-          closeTo(6, 0.5),
+          harness.controller.state.instruction,
+          'Verifying the station reference — keep the phone at the station.',
         );
+        // The record still shows what was measured: 6° off, and the filtered
+        // orientation is that same pose rather than a blend with the one held
+        // before the interruption — the smoother was reset across the gap.
         final restored = harness.controller.diagnostics.entries.last;
+        expect(restored.errorDeg, closeTo(6, 0.5));
         expect(
           restored.filtered.maxComponentDiff(restored.raw),
           lessThan(1e-9),
         );
 
-        // And because that alignment is 6° off, the line names the recovery
-        // instead of a turn. A resumed stream produces a usable alignment on
-        // its very first frame, so a latch that cleared there would be
-        // unreadable — it holds until the target is actually aimed again.
-        expect(harness.controller.state.trackingRecovering, isTrue);
-        expect(
-          harness.controller.state.instruction,
-          'Tracking restored — realigning target.',
+        // Verification is its own 600 ms hold on the station-relative camera.
+        // Once it completes, the aim is published — still 6° off, so the line
+        // names a turn and the shutter stays shut.
+        await harness.emitStable(
+          orientation: Quat.fromYawPitch(6, 0),
+          count: 14,
         );
+        expect(harness.controller.state.trackingRecovering, isFalse);
+        expect(
+          harness.controller.state.alignment!.angularErrorDeg,
+          closeTo(6, 0.5),
+        );
+        expect(harness.gateway.stillRequests, 0);
 
         harness.now = harness.now.add(const Duration(milliseconds: 60));
         await harness.emit();
@@ -1038,7 +1101,7 @@ void main() {
     );
 
     test('the motion record captures raw, filtered and the outcome', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
       await harness.emitStable(count: 12);
 
@@ -1057,7 +1120,7 @@ void main() {
     });
 
     test('the stability monitor reports why it refused', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       await harness.controller.selectTarget(1);
       await harness.emit(); // one aligned sample: the window has not elapsed
       expect(harness.controller.state.stable, isFalse);
@@ -1067,14 +1130,14 @@ void main() {
 
   // ── probing the room after calibration ─────────────────────────────────
   group('direction probe', () {
-    test('calibration probes all 30 directions', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+    test('calibration probes all 26 directions', () async {
+      final harness = await calibratedHarness();
       expect(harness.gateway.probeCalls, greaterThanOrEqualTo(1));
       expect(harness.controller.state.probes.length, kCaptureTargetCount);
     });
 
     test('a probe records a surface per direction, and counts them', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       harness.gateway.probeResults = <SurfaceProbe>[
         for (var i = 0; i < kCaptureTargetCount; i++)
           i.isEven
@@ -1090,14 +1153,14 @@ void main() {
 
       final probes = harness.controller.state.probes;
       expect(probes.length, kCaptureTargetCount);
-      expect(harness.controller.state.probesWithSurface, 15);
+      expect(harness.controller.state.probesWithSurface, 13);
       expect(probes[1]!.found, isTrue);
       expect(probes[1]!.describe, 'wall · 2.4 m');
       expect(probes[2]!.found, isFalse);
     });
 
     test('a probe does not create anchors', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       final before = harness.gateway.anchorCreations;
       harness.gateway.probeResults = <SurfaceProbe>[
         for (var i = 0; i < kCaptureTargetCount; i++)
@@ -1109,7 +1172,7 @@ void main() {
     });
 
     test('the message reports how many directions have a surface', () async {
-      final harness = await calibratedHarness(autoCapture: false);
+      final harness = await calibratedHarness();
       harness.gateway.probeResults = <SurfaceProbe>[
         for (var i = 0; i < kCaptureTargetCount; i++)
           i < 4
@@ -1121,7 +1184,10 @@ void main() {
       ];
       await harness.controller.probeTargets();
       await Harness.flush();
-      expect(harness.controller.state.message, contains('4 of 30'));
+      expect(
+        harness.controller.state.message,
+        contains('4 of $kCaptureTargetCount'),
+      );
     });
   });
 }

@@ -73,24 +73,21 @@ void main() {
       expect(level(const Vec3(0, -2, 0)).onScreen, isFalse);
     });
 
-    test('a near-horizon direction is an edge indicator, never a huge pixel', () {
-      final p = project(const Vec3(1, 0, 0.00011), 1080, 1920, 60, 60);
-      expect(p.onScreen, isFalse);
-      expect(p.u, inInclusiveRange(12, 1068));
-      expect(p.v, inInclusiveRange(12, 1908));
-    });
+    test(
+      'a near-horizon direction is an edge indicator, never a huge pixel',
+      () {
+        final p = project(const Vec3(1, 0, 0.00011), 1080, 1920, 60, 60);
+        expect(p.onScreen, isFalse);
+        expect(p.u, inInclusiveRange(12, 1068));
+        expect(p.v, inInclusiveRange(12, 1908));
+      },
+    );
 
     test('non-finite projection input is rejected without reaching Canvas', () {
-      final p = project(
-        const Vec3(double.infinity, 0, 1),
-        1080,
-        1920,
-        60,
-        60,
-      );
+      final p = project(const Vec3(double.infinity, 0, 1), 1080, 1920, 60, 60);
       expect(p.onScreen, isFalse);
-      expect(p.u, isFinite);
-      expect(p.v, isFinite);
+      expect(p.u.isFinite, isTrue);
+      expect(p.v.isFinite, isTrue);
     });
   });
 

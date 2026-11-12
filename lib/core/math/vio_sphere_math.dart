@@ -1,7 +1,7 @@
 /// VIO sphere mathematics for the 360° capture module.
 ///
 /// **Pure Dart, no Flutter, no platform channels, no clock.** Everything the
-/// capture runtime asks about the geometry — where the 30 world-locked targets
+/// capture runtime asks about the geometry — where the 26 world-locked targets
 /// are, how far the phone may wander from the station, how large the alignment
 /// error is, whether the pose has been steady for the whole window — is decided
 /// here, and is therefore assertable by `flutter test` without a device.
@@ -10,7 +10,7 @@
 ///
 /// **Phase A — calibration, once per session.** [VioSphereEngine.calibrate]
 /// freezes the station origin and the gravitational-horizontal station yaw, then
-/// generates the 30 target world positions exactly once. Nothing below can move
+/// generates the 26 target world positions exactly once. Nothing below can move
 /// them afterwards: [stationOrigin], [stationYawRad] and [nodes] are written
 /// once and read-only after that.
 ///
@@ -55,6 +55,9 @@ abstract final class VioSphereConstants {
 
   /// Maximum allowed station-centre drift, in metres. **Inclusive**: exactly
   /// 0.20 m is inside, 0.2000001 m is not.
+  ///
+  /// Documentation recommendation (not active): 0.10 m for tighter station
+  /// discipline on high-end devices; active value kept at 0.20 m.
   static const double maxStationDriftM = 0.20;
 
   /// Maximum allowed 3D alignment error, in degrees. **Inclusive**.
@@ -62,11 +65,17 @@ abstract final class VioSphereConstants {
   /// The shutter's strict, instantaneous alignment limit. Hysteresis belongs
   /// to the capture hold in the controller; it must never widen this final
   /// acceptance test.
+  ///
+  /// Documentation recommendation (not active): 5.0° for looser aiming on
+  /// small screens; active value kept at 3.0°.
   static const double maxAlignmentErrorDeg = 3.0;
 
   /// How long the pose must hold still before the shutter may fire.
   ///
   /// A full 600 ms of valid, stable aiming is required before capture.
+  ///
+  /// Documentation recommendation (not active): 500 ms for snappier capture on
+  /// steady hands; active value kept at 600 ms.
   static const Duration stabilityWindow = Duration(milliseconds: 600);
 
   /// The oldest pose that may still be acted on, in milliseconds.
@@ -78,6 +87,8 @@ abstract final class VioSphereConstants {
 
   /// How far the position may wander across the window, in metres.
   ///
+  /// Documentation recommendation (not active): 0.05 m; active value kept at
+  /// 0.03 m.
   static const double maxWindowPositionDriftM = 0.03;
 
   /// The fastest rotation that still counts as "held still", in degrees/second.
@@ -109,30 +120,37 @@ abstract final class VioSphereConstants {
   ///
   /// `sin(10°)`: beyond 10° from vertical the projection of the optical axis
   /// onto the horizontal plane is too short for its direction to mean anything,
-  /// and the yaw of the whole 30-target arrangement would be decided by hand
+  /// and the yaw of the whole 26-target arrangement would be decided by hand
   /// shake. Calibration is refused instead of silently defaulting to zero.
   static const double minCalibrationHorizontalComponent = 0.17364817766693041;
 
-  /// Horizontal ring: 12 targets at 0°, every 30°.
-  static const int horizontalCount = 12;
-  static const double horizontalAzimuthStepDeg = 30.0;
+  /// Horizontal ring: 8 targets at 0°, every 45°.
+  static const int horizontalCount = 8;
+  static const double horizontalAzimuthStepDeg = 45.0;
 
-  /// Upper and lower rings: 8 targets each at ±35°, every 45°.
+  /// Upper and lower rings: 8 targets each at ±45°, every 45°.
   static const int upperCount = 8;
   static const int lowerCount = 8;
-  static const double upperElevationDeg = 35.0;
-  static const double lowerElevationDeg = -35.0;
+  static const double upperElevationDeg = 45.0;
+  static const double lowerElevationDeg = -45.0;
   static const double ringAzimuthStepDeg = 45.0;
 
-  /// The two near-poles.
-  static const double zenithElevationDeg = 85.0;
-  static const double nadirElevationDeg = -85.0;
+  /// The two exact poles.
+  ///
+  /// ±90° puts the zenith and nadir where `directionFromYawPitch` yields the
+  /// pure ±Y axis. Yaw is mathematically undefined there, which is not a
+  /// problem anywhere it is consumed: the direction vector is exact,
+  /// `atan2(0, 0)` returns 0 rather than NaN, and the guidance path recognises
+  /// a pole by pitch (`CaptureTarget.isPole` at ≥ 89.999°) and offers
+  /// vertical-only wording instead of an azimuth that would mean nothing.
+  static const double zenithElevationDeg = 90.0;
+  static const double nadirElevationDeg = -90.0;
 
-  /// 12 + 8 + 8 + 1 + 1.
-  static const int nodeCount = 30;
+  /// 8 + 8 + 8 + 1 + 1.
+  static const int nodeCount = 26;
 
-  /// Index boundaries, fixed by the specification:
-  /// horizontal 0–11, upper 12–19, lower 20–27, zenith 28, nadir 29.
+  /// Index boundaries:
+  /// horizontal 0–7, upper 8–15, lower 16–23, zenith 24, nadir 25.
   static const int upperFirstIndex = horizontalCount;
   static const int lowerFirstIndex = upperFirstIndex + upperCount;
   static const int zenithIndex = lowerFirstIndex + lowerCount;
@@ -394,15 +412,15 @@ class VioPoseSample {
       'VioPoseSample($position, $rotation, ${timestamp.inMilliseconds}ms)';
 }
 
-/// One of the 30 world-locked capture targets.
+/// One of the 26 world-locked capture targets.
 ///
 /// [worldPosition] and [modelMatrix] are computed **once**, at calibration, from
 /// the frozen station reference. They are not recomputed from a live pose, and
 /// nothing in this file ever writes them again — which is what "world-locked"
 /// means here.
 class TourTargetNode {
-  /// 0-based, fixed by the specification:
-  /// horizontal 0–11, upper 12–19, lower 20–27, zenith 28, nadir 29.
+  /// 0-based, fixed by the layout:
+  /// horizontal 0–7, upper 8–15, lower 16–23, zenith 24, nadir 25.
   final int index;
 
   /// `Horizontal`, `Upper`, `Lower`, `Zenith` or `Nadir`.
@@ -473,8 +491,18 @@ class TourTargetNode {
 /// Every field is derived from the frozen station reference and the pose that
 /// was passed in; none of them is stored back into the engine.
 class FrameGateEvaluation {
-  /// The 3D distance from the live camera to the frozen station origin.
+  /// The 3D distance the capture gate applies: from the live camera to the
+  /// station drift reference (the frozen origin, or a verified rotation arc).
   final double stationDriftM;
+
+  /// The TRUE 3D distance from the live camera to the frozen station origin,
+  /// before any rotation-in-place compensation. Never filtered: diagnostics
+  /// and the on-screen distance must keep reporting the physical measurement.
+  /// `null` on older/alternate constructors, where [stationDriftM] is itself
+  /// the raw value.
+  final double? rawStationDriftM;
+
+  double get rawDriftM => rawStationDriftM ?? stationDriftM;
 
   /// [VioSphereConstants.maxStationDriftM] applied inclusively.
   final bool isWithinStation;
@@ -522,13 +550,14 @@ class FrameGateEvaluation {
   /// ```
   /// canTriggerShutter = isArTracking && !activeTarget.isCaptured &&
   ///   !isSavingInProgress && !isFailureLatched &&
-  ///   (!enforceStationDrift || isWithinStationDriftGate) &&
+  ///   isWithinStationDriftGate &&
   ///   isAligned && isPoseSteady
   /// ```
   final bool canTriggerShutter;
 
   const FrameGateEvaluation({
     required this.stationDriftM,
+    this.rawStationDriftM,
     required this.isWithinStation,
     required this.activeTargetIndex,
     required this.targetDistanceM,
@@ -595,7 +624,7 @@ class CalibrationResult {
   /// The frozen gravitational-horizontal station yaw in radians, when [ok].
   final double? stationYawRad;
 
-  /// The 30 world-locked targets, when [ok].
+  /// The 26 world-locked targets, when [ok].
   final List<TourTargetNode> nodes;
 
   const CalibrationResult({
@@ -607,7 +636,7 @@ class CalibrationResult {
   });
 }
 
-/// The station reference and the 30 targets, plus the live gate.
+/// The station reference and the 26 targets, plus the live gate.
 ///
 /// One instance per capture session. [calibrate] is the only writer.
 class VioSphereEngine {
@@ -653,7 +682,7 @@ class VioSphereEngine {
   double? get stationYawDeg =>
       _stationYawRad == null ? null : _stationYawRad! * 180 / math.pi;
 
-  /// The 30 world-locked targets. Empty before calibration.
+  /// The 26 world-locked targets. Empty before calibration.
   List<TourTargetNode> get nodes => _nodes;
 
   bool get isCalibrated => _stationOrigin != null && _stationYawRad != null;
@@ -707,7 +736,7 @@ class VioSphereEngine {
   }
 
   /// Phase A, end to end: freezes the station origin and yaw from [pose] and
-  /// generates the 30 world-locked targets.
+  /// generates the 26 world-locked targets.
   ///
   /// Call **once** per capture session, from the "Calibrate station" action. A
   /// second call replaces the reference — which is the deliberate "new
@@ -745,7 +774,7 @@ class VioSphereEngine {
     }
     _stationOrigin = stationOrigin;
     _stationYawRad = stationYawRad;
-    _nodes = build30NodeSphere(
+    _nodes = buildNodeSphere(
       stationOriginWorld: stationOrigin,
       stationYawRad: stationYawRad,
       radiusM: radiusM,
@@ -769,17 +798,17 @@ class VioSphereEngine {
     resetStability();
   }
 
-  /// Generates the 30 world-locked target positions.
+  /// Generates the 26 world-locked target positions.
   ///
   /// ```
   /// d_i = [ cosθ·sin(ψ0 + α),  sinθ,  -cosθ·cos(ψ0 + α) ]
   /// P_i = P_station + r · d_i
   /// ```
   ///
-  /// With `r = 1.0 m`. The layout is fixed: 12 horizontal at 0° every 30°, 8
-  /// upper at +35° every 45°, 8 lower at −35° every 45°, one zenith at +85°, one
-  /// nadir at −85°, in that index order. Nothing here adapts to the input.
-  List<TourTargetNode> build30NodeSphere({
+  /// With `r = 1.0 m`. The layout is fixed: 8 horizontal at 0° every 45°, 8
+  /// upper at +45° every 45°, 8 lower at −45° every 45°, one zenith at +90°, one
+  /// nadir at −90°, in that index order. Nothing here adapts to the input.
+  List<TourTargetNode> buildNodeSphere({
     required Vec3 stationOriginWorld,
     required double stationYawRad,
     double? radiusM,
@@ -966,7 +995,7 @@ class VioSphereEngine {
   /// Evaluates one live frame against the frozen station reference.
   ///
   /// This is Phase B and it is **read-only with respect to the station**: the
-  /// origin, the yaw and the 30 world positions are never recomputed here. The
+  /// origin, the yaw and the 26 world positions are never recomputed here. The
   /// only state it advances is the stability history.
   ///
   /// [isSavingInProgress] and [isFailureLatched] are controller concerns rather
@@ -988,10 +1017,14 @@ class VioSphereEngine {
     required int activeTargetIndex,
     bool isSavingInProgress = false,
     bool isFailureLatched = false,
-    /// Allows an explicit, temporary diagnostic bypass of the station-distance
-    /// gate without weakening pose freshness, alignment or stability. The raw
-    /// distance remains in [FrameGateEvaluation] for diagnostics.
-    bool enforceStationDrift = true,
+
+    /// A verified in-place rotation arc point. When supplied, the station gate
+    /// measures drift from it instead of from the frozen origin. This changes
+    /// ONLY the distance check: the station origin, orientation, 26 world
+    /// anchors and the camera → anchor alignment are all unchanged. `null`
+    /// keeps the original strict frozen-origin behaviour.
+    Vec3? stationDriftReference,
+
     /// Whether this frame belongs to the continuous, hysteretic alignment
     /// window. The strict [isAligned] calculation below still controls the
     /// instant a shutter can fire.
@@ -1020,15 +1053,20 @@ class VioSphereEngine {
       );
     }
 
-    // 2. Station drift: a full 3D distance, not a horizontal-only one, because
-    //    walking away vertically (a step, a chair) moves the composition too.
-    final stationDriftM = Vec3.distance(pose.position, origin);
+    // 2. Station drift. The raw distance to the frozen origin is always
+    //    measured and reported. When a rotation-in-place arc has been verified,
+    //    the GATE measures the deviation from that arc instead: turning about a
+    //    stable centre moves the phone but does not change the capture station.
+    //    The frozen origin and all 26 anchors are untouched either way.
+    final rawStationDriftM = Vec3.distance(pose.position, origin);
+    final driftReference = stationDriftReference ?? origin;
+    final stationDriftM = Vec3.distance(pose.position, driftReference);
     final isWithinStation = stationDriftM <= maxStationDriftM;
 
     // A drift excursion invalidates the stability window: capture may not be
     // armed from a hold that spans a walk-away, and a fresh 600 ms hold is
     // required after returning inside the threshold.
-    if (enforceStationDrift && !isWithinStation) {
+    if (!isWithinStation) {
       resetStability();
     }
 
@@ -1069,6 +1107,7 @@ class VioSphereEngine {
       resetStability();
       return FrameGateEvaluation(
         stationDriftM: stationDriftM,
+        rawStationDriftM: rawStationDriftM,
         isWithinStation: isWithinStation,
         activeTargetIndex: activeTargetIndex,
         targetDistanceM: targetDistanceM,
@@ -1097,12 +1136,13 @@ class VioSphereEngine {
         !target.captured &&
         !isSavingInProgress &&
         !isFailureLatched &&
-        (!enforceStationDrift || isWithinStation) &&
+        isWithinStation &&
         isAligned &&
         stability.steady;
 
     return FrameGateEvaluation(
       stationDriftM: stationDriftM,
+      rawStationDriftM: rawStationDriftM,
       isWithinStation: isWithinStation,
       activeTargetIndex: activeTargetIndex,
       targetDistanceM: targetDistanceM,
@@ -1131,6 +1171,7 @@ class VioSphereEngine {
         : 0.0;
     return FrameGateEvaluation(
       stationDriftM: drift,
+      rawStationDriftM: drift,
       isWithinStation: drift <= maxStationDriftM,
       activeTargetIndex: activeTargetIndex,
       targetDistanceM: 0,

@@ -17,31 +17,13 @@ import 'package:adaptive_360_capture_app/features/virtual_tour/platform/ar_types
 /// measurement, its `ARCORE_STATION` logging, the capture gate, the warning
 /// text in the status line, and the `_PhaseChip`/status-text colours all keep
 /// working. Flip to `true` to restore the presentation.
-const bool kStationDriftWarningVisualsEnabled = false;
-
-/// **TEMPORARY TESTING BYPASS — revert after the drift investigation.**
-///
-/// When `true`, the 0.20 m station-distance measurement no longer blocks
-/// capture, in any mode: the automatic verdict skips its `station-drift` and
-/// `station-drift-recovering` blocks, the manual shutter ignores
-/// [CaptureState.stationDrifted], and the "Too far from station — return
-/// within 20 cm" warning (text, chip colour and marker tint) is suppressed.
-///
-/// This is a **distance-check bypass only**. Nothing else is weakened: ARCore
-/// tracking state, pose freshness, camera-to-target alignment (3°), the 600 ms
-/// stability window, anchor verification and station-reference recovery all
-/// still gate the shutter exactly as before. The raw drift keeps being
-/// measured and logged — see `_withStationDriftWarning`, which reports every
-/// crossing of the limit under this bypass instead of raising the warning.
-///
-/// Revert by setting this back to `false`.
-const bool kStationDriftGateBypassed = true;
+const bool kStationDriftWarningVisualsEnabled = true;
 
 /// Who fires the shutter.
 ///
-  /// [manual] is the default: ARCore can refine a target's world pose after
-  /// calibration, so the operator explicitly opts into unattended capture only
-  /// after the scene has settled.
+/// Production capture starts in [automatic], and the controller independently
+/// validates the full ARCore/stability gate before each shutter. [manual] is a
+/// safe non-automatic mode; it never authorizes the controller's auto shutter.
 enum CaptureMode {
   automatic,
   manual;
@@ -152,7 +134,7 @@ class CaptureState {
     this.alignment,
     this.previousGuidance,
     this.alignedHeldMs = 0,
-    this.mode = CaptureMode.manual,
+    this.mode = CaptureMode.automatic,
     this.autoStage = AutoCaptureStage.idle,
     this.autoBlockReason,
     this.measurementFresh = false,
@@ -163,6 +145,8 @@ class CaptureState {
     this.capturing = false,
     this.retryPending = false,
     this.driftM = 0,
+    this.rawStationDriftM = 0,
+    this.rotatingInPlace = false,
     this.stationDriftWarningActive = false,
     this.activeSurfaceType,
     this.activeAnchored = false,
@@ -228,7 +212,7 @@ class CaptureState {
 
   final CaptureStation? station;
 
-  /// All 30 targets, in id order.
+  /// All 26 targets, in id order.
   final List<CaptureTarget> targets;
 
   /// 1-based id of the target being aimed at; 0 before one is chosen.
@@ -241,7 +225,7 @@ class CaptureState {
   /// so rather than pretending every target has been checked.
   final Map<int, SurfaceProbe> probes;
 
-  /// How many of the 30 directions have a surface, when probed.
+  /// How many of the 26 directions have a surface, when probed.
   int get probesWithSurface => probes.values.where((p) => p.found).length;
 
   /// The **unsmoothed** alignment. This is the one the gate, the instruction,
@@ -358,7 +342,7 @@ class CaptureState {
   /// nothing about a failed attempt, so a target whose photograph kept failing
   /// stayed "ready" — and with the auto shutter that meant fire, fail, fire,
   /// fail, forever, with the interface flickering between "Ready to capture"
-  /// and "Saving the photograph…" and the count never leaving 0 of 30.
+  /// and "Saving the photograph…" and the count never leaving 0 of 26.
   ///
   /// It is cleared only by a deliberate move off the target — an error past
   /// `tolerance + hysteresis`, the same threshold that breaks the stability
@@ -369,7 +353,7 @@ class CaptureState {
   /// How far the phone is from the station, in metres.
   ///
   /// Displayed always, and enforced at [geometry]'s
-  /// [CaptureGeometryConfig.stationDriftWarningM]: the 30 targets are placed
+  /// [CaptureGeometryConfig.stationDriftWarningM]: the 26 targets are placed
   /// around the station, so a photograph taken metres away from it is composed
   /// from the wrong place. The comparison is one-sided by design — a **NaN**
   /// drift (the parser's non-finite guard exists so this cannot happen) would
@@ -377,22 +361,26 @@ class CaptureState {
   /// the gate are fixed together.
   final double driftM;
 
+  /// The uncompensated camera-to-frozen-origin distance, in metres.
+  ///
+  /// [driftM] is the value the capture gate applies; when an in-place rotation
+  /// is verified it is the deviation from the established arc. This field keeps
+  /// the true physical distance visible so the UI and logs never hide it.
+  final double rawStationDriftM;
+
+  /// Whether the current pose belongs to a verified rotation about a stable
+  /// centre. Purely informative: it cannot itself open the shutter.
+  final bool rotatingInPlace;
+
   /// Whether the phone is too far from the station to capture.
   ///
   /// The raw predicate used by the phase, block reason and shutter. There is no
   /// hysteresis anywhere on this gate: one sample at or below 0.20 m reopens it
   /// immediately, and the engine then requires a fresh full stability window
   /// before the shutter can fire.
-  /// Whether the raw drift has crossed the station limit.
-  ///
-  /// **Bypassed while [kStationDriftGateBypassed] is `true`** — this predicate
-  /// feeds every capture-blocking decision (manual block reason, instruction
-  /// sentence, display reasons), so during the temporary testing bypass it
-  /// reads `false` regardless of the measurement. The raw [driftM] value is
-  /// still computed, published and logged; `_withStationDriftWarning` reports
-  /// each crossing of the limit directly from the measurement.
-  bool get stationDrifted =>
-      !kStationDriftGateBypassed && driftM > geometry.stationDriftWarningM;
+  /// Whether the raw drift has crossed the station limit. The raw [driftM]
+  /// value is always computed, published and enforced by both shutter paths.
+  bool get stationDrifted => driftM > geometry.stationDriftWarningM;
 
   /// Whether the station-distance warning is being presented.
   ///
@@ -404,15 +392,13 @@ class CaptureState {
 
   /// Whether the station-distance warning may be shown to the operator.
   ///
-  /// The controller normally clears [stationDriftWarningActive] as soon as the
-  /// temporary distance-gate bypass is enabled.  Keeping this derived guard at
-  /// the presentation boundary closes the one-event race where a state emitted
-  /// just before that clear could briefly paint a "Return to station" message
-  /// even though distance is intentionally not a capture restriction for this
-  /// diagnostic build.  The raw flag remains available to the controller for
-  /// its hysteresis bookkeeping and diagnostics.
+  /// A retained value is not a new physical measurement. During recovery, or
+  /// before the active station anchor supplies a live TRACKING pose, the raw
+  /// gate stays conservative but the UI must not present an old value as a new
+  /// walk-back instruction. The neutral reference-verification state owns that
+  /// interval instead.
   bool get stationDriftWarningVisible =>
-      !kStationDriftGateBypassed && stationDriftWarningActive;
+      !trackingRecovering && activeAnchorTracking && stationDriftWarningActive;
 
   /// The surface the active target is anchored to, e.g. `PLANE_VERTICAL`.
   final String? activeSurfaceType;
@@ -472,10 +458,7 @@ class CaptureState {
     final axis = imageAxis;
     if (intrinsics0 == null) return ArCameraIntrinsics.fallbackDisplayFov;
     if (axis != null) {
-      return intrinsics0.displayFovForImageAxis(
-        axisX: axis.x,
-        axisY: axis.y,
-      );
+      return intrinsics0.displayFovForImageAxis(axisX: axis.x, axisY: axis.y);
     }
     return intrinsics0.portraitDisplayFov();
   }
@@ -519,8 +502,7 @@ class CaptureState {
     // A recovered ARCore pose is not yet an authority for the arrow.  The
     // controller keeps this false while it verifies that the station anchor
     // and the recovered camera pose still describe the calibrated world.
-    trackingValid:
-        tracking == TrackingState.tracking && !trackingRecovering,
+    trackingValid: tracking == TrackingState.tracking && !trackingRecovering,
     alignment: alignment,
     previous: previousGuidance,
     alignedHeldMs: alignedHeldMs,
@@ -552,13 +534,20 @@ class CaptureState {
     if (tracking != TrackingState.tracking) return 'Waiting for AR tracking';
     if (trackingRecovering) return 'Verifying station reference';
     if (station == null) return 'Calibrate the station';
+    if (!measurementFresh) return 'Waiting for a fresh camera pose';
+    if (!mode.isAutomatic) return 'Manual mode — automatic capture disabled';
+    if (autoBlockReason == 'anchor-moving') {
+      return 'Waiting for station anchor tracking';
+    }
     if (phase == CapturePhase.unavailable || phase == CapturePhase.failed) {
       return message ?? 'AR is unavailable';
     }
     if (phase != CapturePhase.capturing) return 'Waiting for AR tracking';
     if (activeTarget == null) return 'Select a target';
     if (stationDriftWarningVisible) return 'Return within 20 cm of station';
-    if (!activeAnchored || !activeAnchorTracking) return 'Waiting for AR tracking';
+    if (!activeAnchored || !activeAnchorTracking) {
+      return 'Waiting for AR tracking';
+    }
     if (guidance != GuidanceState.aligned) return 'Align target';
     if (!alignmentHoldComplete || !stable) return 'Hold steady';
     return mode.isAutomatic ? 'Ready to capture' : 'Ready — press Capture';
@@ -569,8 +558,7 @@ class CaptureState {
   /// A getter, not a stored field: it cannot drift out of sync with
   /// [captureBlockReason], because both read the same state.
   ShotPhase get shotPhase => deriveShotPhase(
-    trackingValid:
-        tracking == TrackingState.tracking && !trackingRecovering,
+    trackingValid: tracking == TrackingState.tracking && !trackingRecovering,
     measurementFresh: measurementFresh,
     targetSelected: activeTargetId != 0,
     targetAnchored: activeAnchored,
@@ -677,6 +665,10 @@ class CaptureState {
     if (trackingRecovering) {
       return 'Verifying the station reference — keep the phone at the station.';
     }
+    if (!measurementFresh) return 'Waiting for a fresh camera pose…';
+    if (!mode.isAutomatic) {
+      return 'Manual mode is active — automatic capture is disabled.';
+    }
     if (station == null) return 'Calibrate the station first.';
     if (stationDriftWarningVisible) return _stationDriftMessage;
     final target = activeTarget;
@@ -703,9 +695,11 @@ class CaptureState {
       return _stationDriftMessage;
     }
     if (!activeAnchored) {
-      // Placement fails only when AR refuses the world anchor, and the retry
-      // action for that is the Scan again button.
-      return 'The target is not placed — press Scan again.';
+      // Placement fails only when AR refuses the world anchor. The old retry
+      // action was the "Scan again" button, which no longer exists: calibration
+      // is one place per session, so the honest recovery is to recalibrate the
+      // station (which re-places every target from a fresh pose).
+      return 'The target is not placed — recalibrate the station.';
     }
     if (!activeAnchorTracking) {
       // Placed, but ARCore has not locked onto the anchor yet. The marker is
@@ -713,6 +707,9 @@ class CaptureState {
       // confidence in the world, and a photograph taken without it is composed
       // from an estimate that is still moving.
       return 'Waiting for AR to stabilise the target…';
+    }
+    if (autoBlockReason == 'anchor-moving') {
+      return 'Waiting for the station anchor to settle…';
     }
     final alignment0 = alignment;
     if (alignment0 == null || !alignment0.usable) {
@@ -782,8 +779,9 @@ class CaptureState {
       case 'EXCESSIVE_MOTION':
         return 'You are moving too fast. Hold the phone still.';
       case 'INSUFFICIENT_FEATURES':
-        return 'There is not enough detail to track. Point at a textured '
-            'surface, not a blank wall.';
+        return 'There is not enough stable detail. Move slowly while looking '
+            'across a textured, stationary surface — not a blank wall, '
+            'screen, or moving people.';
       case 'BAD_STATE':
         return 'AR lost its bearings. Point the phone back where you started.';
       case 'CAMERA_UNAVAILABLE':
@@ -837,7 +835,7 @@ class CaptureState {
       // [captureBlockReason]: everything below is measured from the station.
       // This line is always visible (it never collapses), so it is the one
       // that has to name the action. It names exactly one: return to the spot
-      // the 30 targets were built around. Recalibration stays available in the
+      // the 26 targets were built around. Recalibration stays available in the
       // UI, but suggesting it here would invite moving the station to wherever
       // the phone happens to be — which silently redefines the capture
       // geometry instead of correcting the drift.
@@ -933,6 +931,7 @@ class CaptureState {
     ArCameraIntrinsics? intrinsics,
     ({double x, double y})? imageAxis,
     Float64List? displayProjectionMatrix,
+    bool clearDisplayProjectionMatrix = false,
     ArCameraQuality? cameraQuality,
     bool clearCameraQuality = false,
     CaptureStation? station,
@@ -957,6 +956,8 @@ class CaptureState {
     bool? capturing,
     bool? retryPending,
     double? driftM,
+    double? rawStationDriftM,
+    bool? rotatingInPlace,
     bool? stationDriftWarningActive,
     String? activeSurfaceType,
     bool? activeAnchored,
@@ -986,8 +987,9 @@ class CaptureState {
     ceilings: ceilings ?? this.ceilings,
     intrinsics: intrinsics ?? this.intrinsics,
     imageAxis: imageAxis ?? this.imageAxis,
-    displayProjectionMatrix:
-        displayProjectionMatrix ?? this.displayProjectionMatrix,
+    displayProjectionMatrix: clearDisplayProjectionMatrix
+        ? null
+        : (displayProjectionMatrix ?? this.displayProjectionMatrix),
     cameraQuality: clearCameraQuality
         ? null
         : (cameraQuality ?? this.cameraQuality),
@@ -1019,6 +1021,8 @@ class CaptureState {
     capturing: capturing ?? this.capturing,
     retryPending: retryPending ?? this.retryPending,
     driftM: driftM ?? this.driftM,
+    rawStationDriftM: rawStationDriftM ?? this.rawStationDriftM,
+    rotatingInPlace: rotatingInPlace ?? this.rotatingInPlace,
     stationDriftWarningActive:
         stationDriftWarningActive ?? this.stationDriftWarningActive,
     activeSurfaceType: activeSurfaceType ?? this.activeSurfaceType,
@@ -1033,4 +1037,3 @@ class CaptureState {
     meshTriangles: meshTriangles ?? this.meshTriangles,
   );
 }
-

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 
 import 'package:adaptive_360_capture_app/core/math/vio_sphere_math.dart' as vio;
@@ -71,11 +73,11 @@ const ({double r, double g, double b, double a}) kDebugMarkerTint = (
 const bool kGlbDebugMarker = bool.fromEnvironment('glb_debug_marker');
 
 /// Puts the GLB markers at their computed world positions and keeps them
-/// there — all 30 of them, for the whole capture.
+/// there — all 26 of them, for the whole capture.
 ///
 /// ## The arrangement is created once and lives for the session
 ///
-/// The 30 targets are *directions* from the calibrated station. A direction
+/// The 26 targets are *directions* from the calibrated station. A direction
 /// and a radius are a position:
 ///
 /// ```
@@ -84,13 +86,13 @@ const bool kGlbDebugMarker = bool.fromEnvironment('glb_debug_marker');
 ///
 /// **No surface is consulted and none is required.** No raycast finds a wall,
 /// floor or ceiling; no plane has to be tracked; a room ARCore has not mapped
-/// yet places its targets exactly as a fully-mapped one does. Every anchor is
-/// a world-space anchor (`trackableKey: null`) created **once, at calibration
-/// time**, and kept: a photograph never deletes, recreates or repositions a
-/// node, and advancing to the next target only moves the highlight. The
-/// positions are computed once, at placement time; ARCore refines each anchor
-/// in place as it maps the room, and the renderer reads the anchor's tracked
-/// pose every frame.
+/// yet places its targets exactly as a fully-mapped one does. One world-space
+/// station anchor (`trackableKey: null`) is created **once, at calibration
+/// time**; every target is an immutable local transform below it. A photograph
+/// never deletes, recreates or repositions a node, and advancing to the next
+/// target only moves the highlight. The positions are computed once, at
+/// placement time; ARCore refines the shared anchor in place as it maps the
+/// room, and the renderer reads its tracked pose every frame.
 ///
 /// ## A placed anchor is not a *tracked* anchor
 ///
@@ -126,6 +128,10 @@ class PlaneAnchorService {
   /// overlapping call. Reset in `finally` because the service survives a
   /// pause/resume and is used again after the next boot.
   Future<void>? _disposeInFlight;
+
+  /// Serializes create/refresh/release operations so teardown cannot miss a
+  /// station anchor that is still being created by an earlier async call.
+  Future<void> _anchorOperationTail = Future<void>.value();
 
   /// Mesh ids the controller registers with the native renderer.
   static const String targetMeshId = 'target';
@@ -169,15 +175,41 @@ class PlaneAnchorService {
     return ids;
   }
 
+  Future<T> _serializeAnchorOperation<T>(Future<T> Function() operation) {
+    final completer = Completer<T>();
+    final scheduled = _anchorOperationTail.then((_) async {
+      try {
+        completer.complete(await operation());
+      } catch (error, stackTrace) {
+        completer.completeError(error, stackTrace);
+      }
+    });
+    _anchorOperationTail = scheduled.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return completer.future;
+  }
+
   /// Creates one station anchor then derives every target from its immutable
   /// station-local transform. No target requires a raycast or its own anchor.
+  /// The anchor and all 26 local transforms are committed to this service only
+  /// when every required placement succeeds.
   Future<PlacementOutcome> placeAll({
+    required StationFrame station,
+    required List<CaptureTargetSpec> specs,
+  }) => _serializeAnchorOperation(
+    () => _placeAll(station: station, specs: specs),
+  );
+
+  Future<PlacementOutcome> _placeAll({
     required StationFrame station,
     required List<CaptureTargetSpec> specs,
   }) async {
     final placed = <int, AnchoredTarget>{};
     final failures = <int, String>{};
-    var stationAnchor = _stationAnchor;
+    final hadAnchor = _stationAnchor != null;
+    ArCoreAnchor? stationAnchor = _stationAnchor;
     if (stationAnchor == null) {
       try {
         stationAnchor = await _host.createAnchor(
@@ -185,10 +217,10 @@ class PlaneAnchorService {
           orientation: Quat.identity,
           trackableKey: null,
         );
-      } catch (e) {
-        stationAnchor = null;
+      } catch (error) {
         for (final spec in specs) {
-          failures[spec.targetId] = 'Station anchor could not be created: $e';
+          failures[spec.targetId] =
+              'Station anchor could not be created: $error';
         }
         return PlacementOutcome(placed: placed, failures: failures);
       }
@@ -199,60 +231,98 @@ class PlaneAnchorService {
         }
         return PlacementOutcome(placed: placed, failures: failures);
       }
-      _stationAnchor = stationAnchor;
+      if (stationAnchor.tracking != TrackingState.tracking) {
+        await _detachAnchorOnce(stationAnchor.id);
+        for (final spec in specs) {
+          failures[spec.targetId] =
+              'Waiting for a tracked shared station anchor. Recalibrate when AR tracking is stable.';
+        }
+        return PlacementOutcome(placed: placed, failures: failures);
+      }
     }
+
+    final candidates = <int, AnchoredTarget>{};
     for (final spec in specs) {
-      final existing = _placementsById[spec.targetId];
-      if (existing != null) {
-        placed[spec.targetId] = existing;
-        continue;
-      }
-      // One authority for placement: the same function the tests and the
-      // sphere map's contract are written against.
-      final resolved = resolveTarget(
-        station: station,
-        spec: spec,
-        radiusM: geometry.targetRadiusM,
-      );
-      if (resolved.worldPosition.length == 0) {
+      try {
+        final existing = _placementsById[spec.targetId];
+        if (hadAnchor && existing != null) {
+          if (existing.anchor.id != stationAnchor.id) {
+            failures[spec.targetId] =
+                'Target ${spec.targetId} belongs to a different station anchor.';
+          } else {
+            placed[spec.targetId] = existing;
+          }
+          continue;
+        }
+        final resolved = resolveTarget(
+          station: station,
+          spec: spec,
+          radiusM: geometry.targetRadiusM,
+        );
+        if (resolved.worldPosition.length == 0) {
+          failures[spec.targetId] =
+              'Target ${spec.targetId} has no direction from this station.';
+          continue;
+        }
+        final worldPosition = resolved.worldPosition;
+        final modelMatrix = vio.VioSphereEngine.buildModelMatrix(
+          targetWorldPosition: vio.Vec3(
+            worldPosition.x,
+            worldPosition.y,
+            worldPosition.z,
+          ),
+          stationOriginWorld: vio.Vec3(
+            station.origin.x,
+            station.origin.y,
+            station.origin.z,
+          ),
+        );
+        // This fixed station-local offset is composed under the one shared
+        // anchor; no per-target native anchors are created.
+        modelMatrix[12] = worldPosition.x - station.origin.x;
+        modelMatrix[13] = worldPosition.y - station.origin.y;
+        modelMatrix[14] = worldPosition.z - station.origin.z;
+        final placement = AnchoredTarget(
+          anchor: stationAnchor,
+          worldPosition: worldPosition,
+          stationLocalPosition: Vec3(
+            modelMatrix[12],
+            modelMatrix[13],
+            modelMatrix[14],
+          ),
+          facingNormal: resolved.facingNormal,
+          localRotation: resolved.localRotation,
+          modelMatrix: modelMatrix,
+          surfaceType: worldSurfaceLabel,
+        );
+        candidates[spec.targetId] = placement;
+        placed[spec.targetId] = placement;
+      } catch (error) {
         failures[spec.targetId] =
-            'Target ${spec.targetId} has no direction from this station.';
-        continue;
+            'Target ${spec.targetId} could not be placed: $error';
       }
-      final worldPosition = resolved.worldPosition;
-      // The engine's own model matrix for this target, from the same two
-      // points `resolveTarget` used, so the orientation the renderer draws is
-      // the one the maths layer proved correct rather than the quaternion's
-      // minimal-rotation approximation.
-      final modelMatrix = vio.VioSphereEngine.buildModelMatrix(
-        targetWorldPosition: vio.Vec3(
-          worldPosition.x,
-          worldPosition.y,
-          worldPosition.z,
-        ),
-        stationOriginWorld: vio.Vec3(
-          station.origin.x,
-          station.origin.y,
-          station.origin.z,
-        ),
-      );
-      // The renderer composes this station-local translation with the station
-      // anchor, rather than creating thirty independently refinable anchors.
-      modelMatrix[12] = worldPosition.x - station.origin.x;
-      modelMatrix[13] = worldPosition.y - station.origin.y;
-      modelMatrix[14] = worldPosition.z - station.origin.z;
-      final placement = AnchoredTarget(
-        anchor: stationAnchor,
-        worldPosition: worldPosition,
-        stationLocalPosition: Vec3(modelMatrix[12], modelMatrix[13], modelMatrix[14]),
-        facingNormal: resolved.facingNormal,
-        localRotation: resolved.localRotation,
-        modelMatrix: modelMatrix,
-        surfaceType: worldSurfaceLabel,
-      );
-      _placementsById[spec.targetId] = placement;
-      placed[spec.targetId] = placement;
     }
+
+    if (failures.isNotEmpty || placed.length != specs.length) {
+      if (!hadAnchor) {
+        await _detachAnchorOnce(stationAnchor.id);
+        for (final spec in specs) {
+          failures.putIfAbsent(
+            spec.targetId,
+            () =>
+                'Station placement was rolled back because the full target set did not succeed.',
+          );
+        }
+        placed.clear();
+      }
+      return PlacementOutcome(placed: placed, failures: failures);
+    }
+
+    if (!hadAnchor) {
+      _stationAnchor = stationAnchor;
+      _placementsById.clear();
+    }
+    _placementsById.addAll(candidates);
     return PlacementOutcome(placed: placed, failures: failures);
   }
 
@@ -262,15 +332,18 @@ class PlaneAnchorService {
   /// Returns `gone` **only** when the anchor this refresh asked about is still
   /// the live one and the host no longer has it — tracking lost long enough
   /// that ARCore dropped it, or the session restarted. A *paused* anchor comes
-  /// back normally with [AnchoredTarget.isTracking] false: the two states need
-  /// different recoveries (re-place vs. wait), and collapsing them into one
-  /// null is what made a paused marker look like a vanished one.
+  /// back normally with [AnchoredTarget.isTracking] false: the controller
+  /// invalidates a genuinely lost station reference but waits for a paused
+  /// one, rather than collapsing both states into `null`.
   ///
   /// Returns `stale` when the answer describes an anchor that was replaced
   /// while the refresh was in flight. The check lives here, before any state
   /// is mutated, because a caller-visible map has already been overwritten by
   /// the time the answer would reach it.
-  Future<AnchorRefreshOutcome> refresh(int targetId) async {
+  Future<AnchorRefreshOutcome> refresh(int targetId) =>
+      _serializeAnchorOperation(() => _refresh(targetId));
+
+  Future<AnchorRefreshOutcome> _refresh(int targetId) async {
     final current = _stationAnchor;
     final placement = _placementsById[targetId];
     if (current == null || placement == null) {
@@ -424,15 +497,17 @@ class PlaneAnchorService {
     _placementsById.remove(targetId);
   }
 
-  /// Releases every anchor. Used by "Scan again" and by session teardown,
-  /// never by a photograph.
+  /// Releases every anchor. Used by an arrangement rebuild, by a station reset
+  /// (`recalibrateHere`) and by session teardown, never by a photograph.
   ///
   /// The map is snapshotted and emptied synchronously, before any `await`:
   /// iterating the live map across awaited detaches crashed with a
   /// `ConcurrentModificationError` whenever teardown ran while a photograph
   /// or a dropped anchor mutated it. Clearing first also means a [release]
   /// racing this can never double-detach — the in-flight set covers the rest.
-  Future<void> releaseAll() async {
+  Future<void> releaseAll() => _serializeAnchorOperation<void>(_releaseAll);
+
+  Future<void> _releaseAll() async {
     final anchor = _stationAnchor;
     if (anchor == null) return;
     _stationAnchor = null;
@@ -454,8 +529,10 @@ class PlaneAnchorService {
     try {
       await _host.detachAnchor(anchorId);
     } catch (error) {
-      debugPrint('ARCORE_ANCHOR: detach of $anchorId failed or the anchor '
-          'was already gone: $error');
+      debugPrint(
+        'ARCORE_ANCHOR: detach of $anchorId failed or the anchor '
+        'was already gone: $error',
+      );
     } finally {
       _detachInFlight.remove(anchorId);
     }
@@ -501,7 +578,8 @@ class PlacementOutcome {
 /// Three outcomes, because the caller must act differently on each:
 /// * [placement] non-null — the live placement, possibly refined by ARCore;
 /// * [gone] — the anchor that was asked about is still the live one and the
-///   host no longer has it, so a re-placement is the right recovery;
+///   host no longer has it, so the controller must invalidate the station and
+///   require recalibration;
 /// * [stale] — the answer describes an anchor that was replaced while the
 ///   refresh was in flight, so it applies to nothing that is live.
 typedef AnchorRefreshOutcome = ({

@@ -130,7 +130,9 @@ void main() {
 
     expect(result.angularErrorDeg, closeTo(0, 1e-6));
     expect(result.withinTolerance, isTrue);
-    expect(result.instruction, 'Ready to capture. Hold still.');
+    // §1 §10's wording for the aimed state: alignment is not yet a photograph,
+    // so the line names the hold rather than promising the shutter.
+    expect(result.instruction, 'Target aligned — hold steady.');
   });
 
   // ── required case 6 ───────────────────────────────────────────────────

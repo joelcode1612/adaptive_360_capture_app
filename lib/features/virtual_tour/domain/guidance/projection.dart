@@ -188,9 +188,15 @@ ScreenProjection projectWithArCoreProjection(
   required double fallbackHfovDeg,
   required double fallbackVfovDeg,
 }) {
-  if (matrix == null || matrix.length != 16 ||
-      !dc.x.isFinite || !dc.y.isFinite || !dc.z.isFinite ||
-      !w.isFinite || !h.isFinite || w <= 0 || h <= 0 ||
+  if (matrix == null ||
+      matrix.length != 16 ||
+      !dc.x.isFinite ||
+      !dc.y.isFinite ||
+      !dc.z.isFinite ||
+      !w.isFinite ||
+      !h.isFinite ||
+      w <= 0 ||
+      h <= 0 ||
       matrix.any((double value) => !value.isFinite)) {
     return project(dc, w, h, fallbackHfovDeg, fallbackVfovDeg);
   }
@@ -203,9 +209,14 @@ ScreenProjection projectWithArCoreProjection(
   final clipW = matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15];
   final fx = matrix[0].abs() * w / 2;
   final fy = matrix[5].abs() * h / 2;
-  if (!clipX.isFinite || !clipY.isFinite || !clipW.isFinite ||
-      clipW <= _forwardEpsilon || !fx.isFinite || !fy.isFinite ||
-      fx <= 0 || fy <= 0) {
+  if (!clipX.isFinite ||
+      !clipY.isFinite ||
+      !clipW.isFinite ||
+      clipW <= _forwardEpsilon ||
+      !fx.isFinite ||
+      !fy.isFinite ||
+      fx <= 0 ||
+      fy <= 0) {
     return _edgeProjection(direction: dc, w: w, h: h, fx: fx, fy: fy);
   }
 

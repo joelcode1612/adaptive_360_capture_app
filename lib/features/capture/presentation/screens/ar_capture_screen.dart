@@ -30,9 +30,26 @@ class CaptureModuleScreen extends StatefulWidget {
   const CaptureModuleScreen({
     super.key,
     this.geometry = const CaptureGeometryConfig(),
+    this.repository,
+    this.stationId,
+    this.onComplete,
   });
 
   final CaptureGeometryConfig geometry;
+
+  /// Where station, targets, records and JPEGs are written.
+  ///
+  /// SiteWise injects its tour-scoped store (`SiteWiseCaptureRepository`) so the
+  /// AR frames land in the same directory the stitcher and the tour preview
+  /// read. Left null, the module falls back to its own app-wide directory.
+  final CaptureRepository? repository;
+
+  /// The station id to calibrate under. SiteWise passes the tour id, so one
+  /// tour has exactly one station and "resume" is deterministic.
+  final String? stationId;
+
+  /// Called once when all 26 targets have a saved photograph.
+  final VoidCallback? onComplete;
 
   @override
   State<CaptureModuleScreen> createState() => _CaptureModuleScreenState();
@@ -63,7 +80,8 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
       // tell the user that they have to grant anything.
       await PermissionService().ensureCapturePermissions();
 
-      final repository = await FileCaptureRepository.create();
+      final repository =
+          widget.repository ?? await FileCaptureRepository.create();
       final host = ArCoreHost();
       final session = ArSessionService(host);
       final anchors = PlaneAnchorService(host, geometry: widget.geometry);
@@ -75,6 +93,7 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
         photos: photos,
         repository: repository,
         geometry: widget.geometry,
+        defaultStationId: widget.stationId,
       );
       if (!mounted) {
         controller.dispose();
@@ -94,8 +113,22 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
     }
   }
 
+  /// Set once, so a completed station cannot trigger the stitcher twice.
+  bool _reportedComplete = false;
+
   void _onChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    setState(() {});
+    // Completion is the controller's own verdict — every target has a saved
+    // photograph — not a frame count this screen recomputed. The host uses it
+    // to hand the frames to the stitcher exactly once.
+    final state = _controller?.state;
+    if (!_reportedComplete &&
+        state != null &&
+        state.phase == CapturePhase.complete) {
+      _reportedComplete = true;
+      widget.onComplete?.call();
+    }
   }
 
   @override
@@ -115,7 +148,8 @@ class _CaptureModuleScreenState extends State<CaptureModuleScreen>
       final physical = View.of(context).physicalSize;
       final width = physical.width.round();
       final height = physical.height.round();
-      if (width <= 0 || height <= 0 ||
+      if (width <= 0 ||
+          height <= 0 ||
           (width == _surfaceWidth && height == _surfaceHeight)) {
         return;
       }
@@ -247,9 +281,19 @@ class _CaptureBody extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = controller.state;
     final textureId = state.textureId;
+    final holdComplete =
+        state.capturing &&
+        state.activeTarget?.status.isCapturing == true &&
+        state.tracking == TrackingState.tracking &&
+        !state.trackingRecovering &&
+        state.activeAnchorTracking &&
+        (state.alignment?.withinTolerance ?? false);
 
     return PopScope(
-      canPop: false,
+      // SiteWise opens this screen from the Add Property wizard, so the system
+      // back gesture must leave it. Every saved frame is already on disk and the
+      // tour stays a draft, which is what "Resume Previous Capture" restores.
+      canPop: true,
       child: Scaffold(
         backgroundColor: Colors.black,
         body: Stack(
@@ -274,34 +318,29 @@ class _CaptureBody extends StatelessWidget {
                 // so the pointer lagged the arithmetic it was meant to picture.
                 alignment: state.alignment,
                 withinTolerance: state.alignment?.withinTolerance ?? false,
-                // The ring fills with the stability window — but **only when
-                // every other capture condition already holds**. A ring at 100%
-                // now means `readyToCapture`, so a full ring can never sit above
-                // a shutter that is blocked on drift or an untracked anchor.
-                stabilityProgress:
-                    state.displayCaptureBlockReasonBeforeSettle == null
+                // The controller/VIO engine owns the only hold calculation.
+                // Do not show it through an unmet prerequisite; once that same
+                // genuine hold arms a shutter, keep its 100% green confirmation
+                // visible while the real JPEG is being saved.
+                stabilityProgress: holdComplete
+                    ? 1
+                    : state.displayCaptureBlockReasonBeforeSettle == null
                     ? state.stabilityProgress
                     : 0,
-                // Alignment alone cannot arm a shot: walking away from the
-                // calibrated station invalidates the composition. Keep the
-                // central reticle visually honest with the disabled shutter.
-                // With no target selected this is a neutral, persistent
-                // reticle after a completed shot.  A prior target's distance
-                // warning must not keep it amber; selecting the next target
-                // re-enables the real station-distance gate.
+                // A blocked, aligned target is amber so the operator can see
+                // that alignment is not sufficient. Misalignment stays neutral;
+                // tracking loss clears alignment and suspends the sweep.
                 captureBlocked:
                     state.guidanceTarget != null &&
-                    state.stationDriftWarningVisible &&
-                    // The amber reticle is presentation, not safety: the
-                    // shutter stays blocked by `captureBlockReason` either
-                    // way. Gated while tracking is debugged on a device.
-                    kStationDriftWarningVisualsEnabled,
+                    !holdComplete &&
+                    (state.alignment?.withinTolerance ?? false) &&
+                    state.displayCaptureBlockReasonBeforeSettle != null,
+                holdComplete: holdComplete,
                 // A paused anchor is now hidden rather than drawn from its
                 // stale pose, so the overlay must remain neutral too. The
                 // marker and its guidance therefore always appear and disappear
                 // together.
-                anchored:
-                    state.activeAnchored && state.activeAnchorTracking,
+                anchored: state.activeAnchored && state.activeAnchorTracking,
                 // What the arrow *cannot* work without is a camera pose: its
                 // direction is the projection of the target through that pose.
                 // When AR is not tracking, no arrow — the instruction line
@@ -497,7 +536,7 @@ Future<void> _openTargetSheet(
   builder: (BuildContext sheetContext) => _TargetSheet(controller: controller),
 );
 
-/// The 30 targets: the sphere for choosing one, and a list that says, for each,
+/// The 26 targets: the sphere for choosing one, and a list that says, for each,
 /// whether it works.
 ///
 /// The list exists because the sphere shows *where* a target is and whether it is
@@ -549,7 +588,7 @@ class _TargetSheet extends StatelessWidget {
               const SizedBox(height: 4),
               Text(
                 targets.isEmpty
-                    ? 'Calibrate the station to create the 30 targets.'
+                    ? 'Calibrate the station to create the 26 targets.'
                     : '${state.capturedCount} of ${targets.length} saved · '
                           '$ready with a surface · $blocked blocked',
                 style: const TextStyle(
@@ -706,7 +745,8 @@ class _ControlPanelState extends State<_ControlPanel> {
               Expanded(
                 child: Text(
                   '${state.capturedCount} of ${state.totalTargets} captured'
-                  '${state.station == null ? '' : ' · drift ${state.driftM.toStringAsFixed(2)} m'}',
+                  '${state.station == null ? '' : ' · drift ${state.driftM.toStringAsFixed(2)} m'}'
+                  '${state.rotatingInPlace ? ' · raw ${state.rawStationDriftM.toStringAsFixed(2)} m' : ''}',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
@@ -765,34 +805,18 @@ class _ControlPanelState extends State<_ControlPanel> {
               Row(
                 children: [
                   Expanded(
-                    child: state.stationDriftWarningVisible
-                        // A drifted user has two honest options: walk back, or
-                        // anchor a new station here. "Scan again" is neither —
-                        // it re-places the arrangement around the station they
-                        // have left.
+                    child: state.guidanceTarget == null
                         ? _GhostButton(
-                            label: 'Recalibrate here',
-                            enabled:
-                                !state.capturing &&
-                                state.tracking == TrackingState.tracking,
-                            onPressed: () => controller.recalibrateHere(),
-                          )
-                        : _GhostButton(
-                            // With everything saved there is no active target
-                            // to scan or retake from here; the sheet is where
-                            // individual saved targets are re-taken.
-                            label: state.guidanceTarget == null
-                                ? 'Review targets'
-                                : 'Scan again',
+                            label: 'Review targets',
                             enabled: !state.capturing,
-                            onPressed: () {
-                              if (state.guidanceTarget == null) {
-                                _openTargetSheet(context, controller);
-                              } else {
-                                controller.rescanActive();
-                              }
-                            },
-                          ),
+                            onPressed: () =>
+                                _openTargetSheet(context, controller),
+                          )
+                        // Calibration is fixed for the active session. A drift
+                        // warning asks the operator to return to that station;
+                        // it must not offer a hidden way to replace all 26
+                        // target coordinates mid-capture.
+                        : const SizedBox.shrink(),
                   ),
                 ],
               ),
@@ -980,8 +1004,9 @@ String _statusLine(CaptureState state) {
   final tracking = state.tracking == TrackingState.tracking
       ? 'AR tracking OK'
       : _trackingLabel(state.tracking);
+  final rotation = state.rotatingInPlace ? ' · turning in place' : '';
   return '$tracking · ${state.planeSummary} · '
-      '${state.capturedCount}/${state.totalTargets}';
+      '${state.capturedCount}/${state.totalTargets}$rotation';
 }
 
 String _signed(double v) => '${v >= 0 ? '+' : ''}${v.toStringAsFixed(1)}';
@@ -995,11 +1020,11 @@ String? _trackingAdvice(CaptureState state) {
     // computed from the station, not discovered from the room.
     //
     // No guidance target means either nothing is selected yet or every
-    // photograph is saved. In both cases "press Scan again to place the
-    // target" names an action with no target to place.
+    // photograph is saved. In both cases advice about placing "the target"
+    // names an action with no target to place.
     if (state.guidanceTarget == null) return null;
     if (!state.activeAnchored) {
-      return 'Tracking is live — press Scan again to place the target.';
+      return 'Tracking is live — calibrate the station to place the target.';
     }
     return null;
   }

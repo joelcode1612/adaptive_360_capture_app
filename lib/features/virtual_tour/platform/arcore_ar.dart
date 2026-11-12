@@ -278,7 +278,12 @@ class ArCoreHost implements ArCoreGateway {
         ..add(d.y)
         ..add(d.z);
     }
-    final raw = await _channel.invokeListMethod<dynamic>(
+    // The host answers every method with one shape: an outcome map. Surface
+    // probing therefore arrives as `{results: [...]}`, not as a bare list —
+    // reading it with `invokeListMethod` threw a cast error on every scan and
+    // left all 26 targets reported as "no surface". Both shapes are accepted so
+    // a host that returns the bare list keeps working.
+    final raw = await _channel.invokeMethod<dynamic>(
       'probeDirections',
       <String, dynamic>{
         'origin': <double>[origin.x, origin.y, origin.z],
@@ -286,15 +291,20 @@ class ArCoreHost implements ArCoreGateway {
         'maxDistanceM': maxDistanceM,
       },
     );
-    if (raw == null) {
+    final List<dynamic> results;
+    if (raw is Map) {
+      results = (raw['results'] as List<dynamic>?) ?? const <dynamic>[];
+    } else if (raw is List) {
+      results = raw;
+    } else {
       return List<SurfaceProbe>.filled(
         directions.length,
         const SurfaceProbe.miss(),
       );
     }
     return <SurfaceProbe>[
-      for (final dynamic e in raw)
-        if ((e as Map)['hit'] == true)
+      for (final dynamic e in results)
+        if (e is Map && e['hit'] == true)
           SurfaceProbe.found(
             distanceM: (e['distanceM'] as num?)?.toDouble(),
             surfaceType: e['planeType'] as String?,
@@ -724,6 +734,7 @@ class ArCoreAnchor {
 /// A photograph taken through the AR session.
 class ArCoreStill {
   final Uint8List jpeg;
+
   /// Dimensions of the encoded JPEG after image-to-display rotation.
   final int width;
   final int height;

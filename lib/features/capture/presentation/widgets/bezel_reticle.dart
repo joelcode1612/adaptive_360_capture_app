@@ -100,6 +100,7 @@ class BezelReticle extends StatelessWidget {
     required this.progress,
     required this.withinTolerance,
     required this.completed,
+    this.holdComplete = false,
     this.captureBlocked = false,
     this.bezel,
   });
@@ -115,6 +116,12 @@ class BezelReticle extends StatelessWidget {
 
   /// Whether the target has been captured and recorded.
   final bool completed;
+
+  /// Whether a genuine completed hold has already armed the current shutter.
+  ///
+  /// While the real image is being saved, retaining the full green ring makes
+  /// the successful 600 ms hold visible without adding any delay or timer.
+  final bool holdComplete;
 
   /// Whether another capture requirement blocks the shutter despite alignment.
   ///
@@ -135,6 +142,7 @@ class BezelReticle extends StatelessWidget {
         progress: progress,
         withinTolerance: withinTolerance,
         completed: completed,
+        holdComplete: holdComplete,
         captureBlocked: captureBlocked,
         bezel: bezel,
       ),
@@ -147,6 +155,7 @@ class _BezelReticlePainter extends CustomPainter {
     required this.progress,
     required this.withinTolerance,
     required this.completed,
+    required this.holdComplete,
     required this.captureBlocked,
     required this.bezel,
   });
@@ -154,6 +163,7 @@ class _BezelReticlePainter extends CustomPainter {
   final double progress;
   final bool withinTolerance;
   final bool completed;
+  final bool holdComplete;
   final bool captureBlocked;
   final GlbModel? bezel;
 
@@ -169,7 +179,7 @@ class _BezelReticlePainter extends CustomPainter {
     // aimed, muted while not. The station-distance warning must outrank raw
     // alignment: otherwise an aligned ring advertises a capture that the gate
     // must refuse.
-    final baseColor = completed
+    final baseColor = completed || holdComplete
         ? CaptureColors.ok
         : (captureBlocked
               ? CaptureColors.warn
@@ -181,48 +191,48 @@ class _BezelReticlePainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1;
 
+    final Path ring;
+    final Paint progressPaint = Paint()..color = CaptureColors.ok;
     if (model == null) {
-      // The asset has not loaded yet. Same diameter, so nothing pops.
-      //
-      // Two strokes, dark under light. The single line this replaced was 18%
-      // alpha, which is invisible against the pale wall this app is pointed at,
-      // and an aim point the user cannot see is not an aim point. Both are
-      // strokes, so the centre stays transparent and the preview shows through.
+      // The asset has not loaded yet. Same diameter, so nothing pops. Keep this
+      // fallback as a stroked circle, but route it through the same progress
+      // painter as the GLB path so readiness never depends on asset loading.
       final radius = diameter / 2 - 2;
-      canvas.drawCircle(
-        centre,
-        radius,
+      ring = Path()..addOval(Rect.fromCircle(center: centre, radius: radius));
+      progressPaint
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3;
+      canvas.drawPath(
+        ring,
         Paint()
           ..color = Colors.black.withValues(alpha: 0.55)
           ..style = PaintingStyle.stroke
           ..strokeWidth = 5,
       );
-      canvas.drawCircle(
-        centre,
-        radius,
+      canvas.drawPath(
+        ring,
         Paint()
           ..color = baseColor
           ..style = PaintingStyle.stroke
           ..strokeWidth = 3,
       );
-      return;
+    } else {
+      ring = buildBezelRingPath(model, size: diameter).shift(
+        Offset((size.width - diameter) / 2, (size.height - diameter) / 2),
+      );
+      // A dark hairline behind the ring keeps a white marker legible over a
+      // white wall, which is exactly the surface this app is pointed at.
+      canvas.drawPath(ring, shadow);
+      canvas.drawPath(ring, base);
     }
 
-    final ring = buildBezelRingPath(
-      model,
-      size: diameter,
-    ).shift(Offset((size.width - diameter) / 2, (size.height - diameter) / 2));
-
-    // A dark hairline behind the ring keeps a white marker legible over a white
-    // wall, which is exactly the surface this app is pointed at.
-    canvas.drawPath(ring, shadow);
-    canvas.drawPath(ring, base);
-
     // The progress sweep, clipped to the ring so it fills the band rather than
-    // sitting beside it.
+    // sitting beside it. This is shared by the GLB and fallback paths.
     final p = progress.clamp(0.0, 1.0);
-    if (completed) {
-      canvas.drawPath(ring, Paint()..color = CaptureColors.ok);
+    if (completed ||
+        holdComplete ||
+        (!captureBlocked && withinTolerance && p >= 1)) {
+      canvas.drawPath(ring, progressPaint);
     } else if (!captureBlocked && withinTolerance && p > 0) {
       canvas.save();
       canvas.clipPath(
@@ -236,7 +246,7 @@ class _BezelReticlePainter extends CustomPainter {
           )
           ..close(),
       );
-      canvas.drawPath(ring, Paint()..color = CaptureColors.ok);
+      canvas.drawPath(ring, progressPaint);
       canvas.restore();
     }
 
@@ -250,6 +260,7 @@ class _BezelReticlePainter extends CustomPainter {
       old.progress != progress ||
       old.withinTolerance != withinTolerance ||
       old.completed != completed ||
+      old.holdComplete != holdComplete ||
       old.captureBlocked != captureBlocked ||
       !identical(old.bezel, bezel);
 }

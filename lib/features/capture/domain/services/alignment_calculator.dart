@@ -318,7 +318,8 @@ class AlignmentResult {
       // the user is told to turn around rather than to make a tiny correction.
       GuidanceState.behind => instruction,
       GuidanceState.trackingPaused => 'Waiting for AR tracking.',
-      GuidanceState.awaitingTarget => message ?? 'Waiting for a target position.',
+      GuidanceState.awaitingTarget =>
+        message ?? 'Waiting for a target position.',
     };
   }
 
@@ -534,10 +535,7 @@ GuidanceState _verticalGuidance({
 /// lost, and when the station is recalibrated: carrying an estimate across any
 /// of those would blend two different targets' directions into one.
 class DisplayDirectionFilter {
-  DisplayDirectionFilter({
-    this.alpha = 0.35,
-    this.maxDeviationDeg = 4.0,
-  });
+  DisplayDirectionFilter({this.alpha = 0.35, this.maxDeviationDeg = 4.0});
 
   /// Weight of the newest sample, 0…1. Higher follows the raw pose more closely.
   final double alpha;

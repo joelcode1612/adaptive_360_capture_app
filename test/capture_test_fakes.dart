@@ -53,9 +53,24 @@ class FakeArGateway implements ArCoreGateway {
   int stillWidth = 1920;
   int stillHeight = 1080;
 
-  /// The pose the fake still reports, or `null` for the "host did not report
-  /// the photograph's pose" case the screen must refuse.
+  /// The pose the fake still reports, or `null` to fall back to the pose of the
+  /// frame that armed the shutter — which is what a real host reports.
   ArPose? stillPose;
+
+  /// Reproduces a host that cannot report the photograph's pose at all. The
+  /// shutter must refuse it rather than trust the arming frame's alignment.
+  bool omitStillPose = false;
+
+  /// The most recent pose pushed through [emitPose]. A still is exposed on a
+  /// render frame, so it carries that frame's ARCore timestamp.
+  ArPose? _lastEmittedPose;
+
+  /// The pose of the most recent frame, exposed so a test can pin the still to
+  /// the frame that armed the shutter. A real camera returns the frame it was
+  /// asked to capture, however long its pipeline takes; without the pin, a
+  /// test that keeps emitting while the write is in flight makes the still
+  /// older than the freshness limit and the save correctly refuses it.
+  ArPose? get lastEmittedPose => _lastEmittedPose;
 
   /// How many anchors were created. Asserted by "a miss must not anchor".
   int anchorCreations = 0;
@@ -145,7 +160,8 @@ class FakeArGateway implements ArCoreGateway {
     required Quat worldOrientation,
     TrackingState tracking = TrackingState.tracking,
     int planesTracked = 3,
-    ({Vec3 position, TrackingState tracking})? activeAnchorPose,
+    ({Vec3 position, Quat orientation, TrackingState tracking})?
+    activeAnchorPose,
     String? reportedActiveAnchorId,
     bool includeActiveAnchorPose = true,
   }) {
@@ -154,22 +170,29 @@ class FakeArGateway implements ArCoreGateway {
     if (includeActiveAnchorPose && live == null) {
       final active = anchors[activeAnchorId];
       if (active != null) {
-        live = (position: active.worldPosition, tracking: active.tracking);
+        // ArCoreAnchor carries no rotation, so the fake reports identity rather
+        // than inventing one. The controller reads only position and tracking.
+        live = (
+          position: active.worldPosition,
+          orientation: Quat.identity,
+          tracking: active.tracking,
+        );
       }
     }
+    _lastEmittedPose = ArPose(
+      position: position,
+      // `ArPose.captureWorld` is `arCameraPoseToCaptureWorld(orientation)`,
+      // so the fake hands over the *converted* quaternion and the getter
+      // must be given the pre-conversion one. Round-tripping through the
+      // real inverse keeps the fake honest.
+      orientation: worldOrientation * Quat.axisAngle(180, Vec3.unitY),
+      tracking: tracking,
+      timestampNs: clock().microsecondsSinceEpoch * 1000,
+    );
     _events.add(
       ArCoreEvent.pose(
         ArPoseSample(
-          raw: ArPose(
-            position: position,
-            // `ArPose.captureWorld` is `arCameraPoseToCaptureWorld(orientation)`,
-            // so the fake hands over the *converted* quaternion and the getter
-            // must be given the pre-conversion one. Round-tripping through the
-            // real inverse keeps the fake honest.
-            orientation: worldOrientation * Quat.axisAngle(180, Vec3.unitY),
-            tracking: tracking,
-            timestampNs: clock().microsecondsSinceEpoch * 1000,
-          ),
+          raw: _lastEmittedPose!,
           planesTracked: planesTracked,
           planeCount: planesTracked,
           activeAnchorPose: live,
@@ -410,8 +433,11 @@ class FakeArGateway implements ArCoreGateway {
       jpeg: bytes,
       width: stillWidth,
       height: stillHeight,
+      // width/height are post-rotation, so a quarter turn swaps the source axes.
+      sourceWidth: stillHeight,
+      sourceHeight: stillWidth,
       rotationAppliedDeg: 90,
-      capturePose: stillPose,
+      capturePose: omitStillPose ? null : (stillPose ?? _lastEmittedPose),
     );
   }
 
@@ -452,6 +478,11 @@ class FakeCaptureRepository implements CaptureRepository {
 
   /// When set, [saveRecord] throws instead of writing.
   Object? recordError;
+
+  /// When set, [saveCalibration] throws instead of writing either file.
+  Object? calibrationError;
+
+  int saveCalibrationCalls = 0;
 
   /// When set, saving writes but the file "disappears" — the read-back check is
   /// what has to catch this.
@@ -501,6 +532,19 @@ class FakeCaptureRepository implements CaptureRepository {
   Future<void> saveTargets(List<CaptureTarget> list) async {
     if (list.isEmpty) return;
     targets[list.first.stationId] = List<CaptureTarget>.of(list);
+  }
+
+  @override
+  Future<void> saveCalibration(
+    CaptureStation station,
+    List<CaptureTarget> list,
+  ) async {
+    saveCalibrationCalls++;
+    if (calibrationError != null) throw calibrationError!;
+    stations[station.stationId] = station;
+    if (list.isNotEmpty) {
+      targets[station.stationId] = List<CaptureTarget>.of(list);
+    }
   }
 }
 

@@ -83,7 +83,7 @@ void main() {
     });
   });
 
-  group('where each of the 30 targets lands', () {
+  group('where each of the 26 targets lands', () {
     ({Vec3 worldPosition, Vec3 facingNormal, Quat localRotation}) resolve(
       CaptureTargetSpec spec,
     ) => resolveTarget(
@@ -121,11 +121,11 @@ void main() {
     });
 
     test('upper ring is up, lower ring is down, poles are the poles', () {
-      // The rings sit at ±35° and the near-poles at ±85°, not the old ±45°/±90°:
-      // elevation θ puts a target at y = r·sin θ.
-      final upperY = math.sin(35 * math.pi / 180) * geometry.targetRadiusM;
+      // The rings sit at ±45° and the two poles at ±90°: elevation θ puts a
+      // target at y = r·sin θ.
+      final upperY = math.sin(45 * math.pi / 180) * geometry.targetRadiusM;
       final lowerY = -upperY;
-      final poleY = math.sin(85 * math.pi / 180) * geometry.targetRadiusM;
+      final poleY = geometry.targetRadiusM;
       for (final spec in buildCaptureSphere()) {
         final p = resolve(spec).worldPosition;
         if (spec.ringName == kUpperRingName) {
@@ -138,11 +138,11 @@ void main() {
           expect(p.y, closeTo(0, 1e-9), reason: 'target ${spec.targetId}');
         }
       }
-      expect(resolve(specFor(0, 85)).worldPosition.y, closeTo(poleY, 1e-9));
-      expect(resolve(specFor(0, -85)).worldPosition.y, closeTo(-poleY, 1e-9));
+      expect(resolve(specFor(0, 90)).worldPosition.y, closeTo(poleY, 1e-9));
+      expect(resolve(specFor(0, -90)).worldPosition.y, closeTo(-poleY, 1e-9));
     });
 
-    test('the sphere map and the AR world agree for all 30', () {
+    test('the sphere map and the AR world agree for all 26', () {
       // The map projects `spec.direction`, station-local. The world position
       // is the same direction through the station frame, so mapping it back
       // must return the direction the map drew.
@@ -214,6 +214,15 @@ void main() {
         activeTargetId: 1,
         activeAnchored: true,
         activeAnchorTracking: true,
+        // The ported instruction line speaks only after the indicator has
+        // latched `aligned` (200 ms) and the alignment hold is complete
+        // (600 ms) — the same interval the shutter itself waits. Without a
+        // fresh pose and a held alignment, a rejection fixture falls through
+        // to the aim sentence and never reaches the stability wording it
+        // exists to pin.
+        textureId: 1,
+        measurementFresh: true,
+        alignedHeldMs: 700,
         alignment: AlignmentResult(
           directionWorld: Vec3.unitZ,
           directionInCamera: Vec3.unitZ,
@@ -265,10 +274,14 @@ void main() {
     });
 
     test('ready only when stable, and then it says capture', () {
-      expect(
-        stateWith(rejection: null, stable: true).instruction,
-        contains('Ready to capture'),
-      );
+      final state = stateWith(rejection: null, stable: true);
+      // The ported state splits what the old test read as one surface: the
+      // gate is [readyToCapture], the summary line [captureStatus] says
+      // "Ready to capture", and the instruction keeps naming the hold the
+      // shutter depends on.
+      expect(state.readyToCapture, isTrue);
+      expect(state.captureStatus, contains('Ready to capture'));
+      expect(state.instruction, 'Target aligned — hold steady.');
     });
   });
 }
